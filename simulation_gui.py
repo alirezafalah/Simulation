@@ -168,9 +168,13 @@ class ClickablePreview(QLabel):
         self._popup_title = title
         self._update_thumbnail()
         # Live-update the open popup if it still exists
-        if self._popup is not None and self._popup.isVisible():
-            self._popup._source_pixmap = pixmap
-            self._popup._apply_zoom()
+        try:
+            if self._popup is not None and self._popup.isVisible():
+                self._popup._source_pixmap = pixmap
+                self._popup._apply_zoom()
+        except RuntimeError:
+            # C++ object already deleted (user closed the popup)
+            self._popup = None
 
     def _update_thumbnail(self) -> None:
         if self._full_pixmap is None:
@@ -285,9 +289,20 @@ class DatasetWorker(QThread):
                 clean_dir = Path(self.clean_output_dir) / tool_name
                 clean_dir.mkdir(parents=True, exist_ok=True)
                 noisy_dir: Optional[Path] = None
+                dent_events: list = []
                 if self.apply_noise:
                     noisy_dir = Path(self.noisy_output_dir) / tool_name
                     noisy_dir.mkdir(parents=True, exist_ok=True)
+                    dent_events = NI.plan_dent_events(
+                        n_events=int(nc["n_events"]),
+                        n_frames=n_frames,
+                        frame_span_min=int(nc["frame_span_min"]),
+                        frame_span_max=int(nc["frame_span_max"]),
+                        dent_span_min=int(nc["dent_span_min"]),
+                        dent_span_max=int(nc["dent_span_max"]),
+                        max_depth=float(nc["max_depth"]),
+                        seed=nc.get("seed"),
+                    )
 
                 for angle in range(n_frames):
                     if self._abort:
@@ -306,13 +321,9 @@ class DatasetWorker(QThread):
                         clean_path, format=img_format)
 
                     if self.apply_noise and noisy_dir is not None:
-                        noisy = NI.inject_noise(
-                            mask,
-                            n_dents=int(nc["n_dents"]),
-                            dent_span_min=int(nc["dent_span_min"]),
-                            dent_span_max=int(nc["dent_span_max"]),
-                            max_depth=float(nc["max_depth"]),
-                            seed=nc.get("seed"),
+                        noisy = NI.inject_noise_frame(
+                            mask, dent_events, angle,
+                            n_frames=n_frames,
                         )
                         noisy_path = str(noisy_dir / f"mask_{angle:03d}.{ext}")
                         Image.fromarray(noisy, mode="L").save(
@@ -423,6 +434,18 @@ class NoiseBatchWorker(QThread):
             self.sig.log.emit(
                 f"[NOISE] Processing {total} masks: {inp} → {out}")
 
+            # Plan temporal dent events once for this folder
+            dent_events = NI.plan_dent_events(
+                n_events=int(nc["n_events"]),
+                n_frames=total,
+                frame_span_min=int(nc["frame_span_min"]),
+                frame_span_max=int(nc["frame_span_max"]),
+                dent_span_min=int(nc["dent_span_min"]),
+                dent_span_max=int(nc["dent_span_max"]),
+                max_depth=float(nc["max_depth"]),
+                seed=nc.get("seed"),
+            )
+
             for i, src in enumerate(files):
                 if self._abort:
                     self.sig.log.emit("[ABORT] Noise batch cancelled.")
@@ -432,14 +455,8 @@ class NoiseBatchWorker(QThread):
                     Image.open(src).convert("L"), dtype=np.uint8)
                 img = np.where(img > 127, 255, 0).astype(np.uint8)
 
-                noisy = NI.inject_noise(
-                    img,
-                    n_dents=int(nc["n_dents"]),
-                    dent_span_min=int(nc["dent_span_min"]),
-                    dent_span_max=int(nc["dent_span_max"]),
-                    max_depth=float(nc["max_depth"]),
-                    seed=nc.get("seed"),
-                )
+                noisy = NI.inject_noise_frame(
+                    img, dent_events, i, n_frames=total)
                 dst = out / src.name
                 Image.fromarray(noisy, mode="L").save(str(dst), format="PNG")
                 self.sig.frame_done.emit(i + 1, total)
@@ -712,35 +729,56 @@ class SimulationGUI(QMainWindow):
         lay.addWidget(nout_group)
 
         # --- Noise parameters ---
-        noise_group = QGroupBox("Dent Parameters (localised contour erosion)")
+        noise_group = QGroupBox("Dent Event Parameters (temporally-coherent contour erosion)")
         form = QFormLayout(noise_group)
 
-        self.spin_n_dents = QSpinBox()
-        self.spin_n_dents.setRange(0, 30)
-        self.spin_n_dents.setValue(NI.N_DENTS)
-        self.spin_n_dents.setToolTip(
-            "Number of independent erosion patches along the contour.\n"
-            "0 = no dents (clean mask)."
+        self.spin_n_events = QSpinBox()
+        self.spin_n_events.setRange(0, 10)
+        self.spin_n_events.setValue(NI.N_EVENTS)
+        self.spin_n_events.setToolTip(
+            "Number of dent events per tool (1\u20132 typical).\n"
+            "Each event appears at a random contour position\n"
+            "for several consecutive frames, then fades away."
         )
-        form.addRow("Number of Dents:", self.spin_n_dents)
+        form.addRow("Events per Tool:", self.spin_n_events)
+
+        self.spin_frame_span_min = QSpinBox()
+        self.spin_frame_span_min.setRange(1, 100)
+        self.spin_frame_span_min.setValue(NI.FRAME_SPAN_MIN)
+        self.spin_frame_span_min.setSuffix("  frames")
+        self.spin_frame_span_min.setToolTip(
+            "Minimum number of consecutive frames each\n"
+            "dent event persists (cosine fade in/out)."
+        )
+        form.addRow("Frame Span Min:", self.spin_frame_span_min)
+
+        self.spin_frame_span_max = QSpinBox()
+        self.spin_frame_span_max.setRange(1, 200)
+        self.spin_frame_span_max.setValue(NI.FRAME_SPAN_MAX)
+        self.spin_frame_span_max.setSuffix("  frames")
+        self.spin_frame_span_max.setToolTip(
+            "Maximum number of consecutive frames each\n"
+            "dent event persists."
+        )
+        form.addRow("Frame Span Max:", self.spin_frame_span_max)
 
         self.spin_span_min = QSpinBox()
         self.spin_span_min.setRange(10, 1000)
         self.spin_span_min.setValue(NI.DENT_SPAN_MIN)
         self.spin_span_min.setSuffix("  contour px")
         self.spin_span_min.setToolTip(
-            "Minimum arc length (in contour pixels) of each dent."
+            "Minimum arc length (contour pixels) of each dent."
         )
-        form.addRow("Span Min:", self.spin_span_min)
+        form.addRow("Dent Span Min:", self.spin_span_min)
 
         self.spin_span_max = QSpinBox()
         self.spin_span_max.setRange(10, 2000)
         self.spin_span_max.setValue(NI.DENT_SPAN_MAX)
         self.spin_span_max.setSuffix("  contour px")
         self.spin_span_max.setToolTip(
-            "Maximum arc length (in contour pixels) of each dent."
+            "Maximum arc length (contour pixels) of each dent."
         )
-        form.addRow("Span Max:", self.spin_span_max)
+        form.addRow("Dent Span Max:", self.spin_span_max)
 
         self.spin_max_depth = QDoubleSpinBox()
         self.spin_max_depth.setRange(0.5, 10.0)
@@ -749,9 +787,9 @@ class SimulationGUI(QMainWindow):
         self.spin_max_depth.setDecimals(1)
         self.spin_max_depth.setSuffix("  px")
         self.spin_max_depth.setToolTip(
-            "Maximum inward erosion depth per dent (pixels).\n"
-            "Each dent picks a random depth in [1.0, max_depth].\n"
-            "1–2 = subtle,  2–3 = visible,  3+ = aggressive."
+            "Peak inward erosion depth per dent (pixels).\n"
+            "Each event picks a random depth in [1.0, max_depth].\n"
+            "1\u20132 = subtle,  2\u20133 = visible,  3+ = aggressive."
         )
         form.addRow("Max Depth:", self.spin_max_depth)
 
@@ -815,7 +853,9 @@ class SimulationGUI(QMainWindow):
         lay.addWidget(prev_group, stretch=1)
 
         # Connect every noise param widget to live preview update
-        self.spin_n_dents.valueChanged.connect(self._update_noise_preview)
+        self.spin_n_events.valueChanged.connect(self._update_noise_preview)
+        self.spin_frame_span_min.valueChanged.connect(self._update_noise_preview)
+        self.spin_frame_span_max.valueChanged.connect(self._update_noise_preview)
         self.spin_span_min.valueChanged.connect(self._update_noise_preview)
         self.spin_span_max.valueChanged.connect(self._update_noise_preview)
         self.spin_max_depth.valueChanged.connect(self._update_noise_preview)
@@ -917,7 +957,9 @@ class SimulationGUI(QMainWindow):
     def _collect_noise_cfg(self) -> Dict[str, Any]:
         seed_val = self.spin_seed.value()
         return dict(
-            n_dents=self.spin_n_dents.value(),
+            n_events=self.spin_n_events.value(),
+            frame_span_min=self.spin_frame_span_min.value(),
+            frame_span_max=self.spin_frame_span_max.value(),
             dent_span_min=self.spin_span_min.value(),
             dent_span_max=self.spin_span_max.value(),
             max_depth=self.spin_max_depth.value(),
@@ -1009,7 +1051,7 @@ class SimulationGUI(QMainWindow):
         nc = self._collect_noise_cfg()
         noisy = NI.inject_noise(
             self._sample_mask,
-            n_dents=int(nc["n_dents"]),
+            n_dents=int(nc["n_events"]),
             dent_span_min=int(nc["dent_span_min"]),
             dent_span_max=int(nc["dent_span_max"]),
             max_depth=float(nc["max_depth"]),
