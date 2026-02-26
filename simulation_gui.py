@@ -11,9 +11,9 @@ PySide6 application with:
     • Multi-CAD-file selection  (each tool → its own subfolder)
     • Separate output directories for clean and noisy masks
     • Debug preview button (off-screen single frame shown in the GUI)
-    • "Generate Dataset" button with two progress bars:
-          – Overall Progress (tools)
-          – Current Tool Progress (360 frames)
+    • Noise tab: live before / after preview, standalone folder batch
+    • Click any preview thumbnail → full-resolution pop-up window
+    • "Generate Dataset" button with two progress bars
     • All heavy work on QThread (GUI never freezes)
 
 Dependencies
@@ -35,7 +35,7 @@ from typing import List, Optional, Dict, Any
 
 # ── Qt ───────────────────────────────────────────────────────────────
 from PySide6.QtCore import (
-    Qt, Signal, Slot, QThread, QObject,
+    Qt, Signal, Slot, QThread, QObject, QSize,
 )
 from PySide6.QtGui import QImage, QPixmap, QFont, QPalette, QColor, QIcon
 from PySide6.QtWidgets import (
@@ -44,7 +44,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox,
     QCheckBox, QComboBox, QFileDialog, QProgressBar,
     QListWidget, QAbstractItemView, QGroupBox, QTextEdit,
-    QSplitter, QMessageBox, QSizePolicy,
+    QSplitter, QMessageBox, QSizePolicy, QDialog, QScrollArea,
 )
 
 # ── Local modules (same folder) ─────────────────────────────────────
@@ -55,30 +55,159 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 # ═════════════════════════════════════════════════════════════════════
-#  WORKER — runs on QThread, emits progress signals
+#  NUMPY ↔ QPixmap HELPERS
+# ═════════════════════════════════════════════════════════════════════
+
+def _gray_to_pixmap(arr: np.ndarray) -> QPixmap:
+    """Convert an H×W uint8 grayscale array to a QPixmap."""
+    h, w = arr.shape[:2]
+    qimg = QImage(arr.data.tobytes(), w, h, w, QImage.Format_Grayscale8)
+    return QPixmap.fromImage(qimg)
+
+
+def _rgb_to_pixmap(arr: np.ndarray) -> QPixmap:
+    """Convert an H×W×3 uint8 RGB array to a QPixmap."""
+    h, w, ch = arr.shape
+    qimg = QImage(arr.data.tobytes(), w, h, ch * w, QImage.Format_RGB888)
+    return QPixmap.fromImage(qimg)
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  IMAGE POP-UP — click to expand any preview to a resizable window
+# ═════════════════════════════════════════════════════════════════════
+
+class ImagePopup(QDialog):
+    """
+    Resizable non-modal dialog showing a pixmap with scroll-wheel
+    zoom.  Opened when the user clicks a preview thumbnail.
+    """
+
+    _ZOOM_MIN = 0.1
+    _ZOOM_MAX = 10.0
+    _ZOOM_STEP = 1.15          # 15 % per wheel notch
+
+    def __init__(
+        self,
+        pixmap: QPixmap,
+        title: str = "Preview",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(480, 360)
+        self.setAttribute(Qt.WA_DeleteOnClose)   # clean up on close
+        # Start at 80 % of pixmap size, capped to 1400×1000
+        w = min(int(pixmap.width() * 0.8), 1400)
+        h = min(int(pixmap.height() * 0.8), 1000)
+        self.resize(max(w, 480), max(h, 360))
+
+        self._source_pixmap = pixmap
+        self._zoom = 1.0
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(False)
+        self._scroll.setAlignment(Qt.AlignCenter)
+        self._scroll.setStyleSheet("background-color: #111;")
+
+        self._label = QLabel()
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setPixmap(pixmap)
+        self._label.resize(pixmap.size())
+        self._scroll.setWidget(self._label)
+        lay.addWidget(self._scroll)
+
+        self._hint = QLabel(self._hint_text())
+        self._hint.setAlignment(Qt.AlignCenter)
+        self._hint.setStyleSheet("color: #888; font-size: 10px; padding: 2px;")
+        lay.addWidget(self._hint)
+
+    def _hint_text(self) -> str:
+        pct = int(self._zoom * 100)
+        return f"Scroll wheel to zoom ({pct} %)  •  Esc to close"
+
+    def _apply_zoom(self) -> None:
+        new_size = self._source_pixmap.size() * self._zoom
+        scaled = self._source_pixmap.scaled(
+            new_size, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._label.setPixmap(scaled)
+        self._label.resize(scaled.size())
+        self._hint.setText(self._hint_text())
+
+    def wheelEvent(self, event):  # noqa: N802
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._zoom = min(self._zoom * self._ZOOM_STEP, self._ZOOM_MAX)
+        elif delta < 0:
+            self._zoom = max(self._zoom / self._ZOOM_STEP, self._ZOOM_MIN)
+        self._apply_zoom()
+        event.accept()
+
+
+class ClickablePreview(QLabel):
+    """
+    A QLabel that stores full-resolution pixmaps and opens a
+    *non-modal* ImagePopup on click (so you can still interact
+    with the main window while the popup is open).
+    """
+    clicked = Signal()
+
+    def __init__(self, placeholder: str = "", parent: Optional[QWidget] = None):
+        super().__init__(placeholder, parent)
+        self.setAlignment(Qt.AlignCenter)
+        self.setCursor(Qt.PointingHandCursor)
+        self._full_pixmap: Optional[QPixmap] = None
+        self._popup_title: str = "Preview"
+        self._popup: Optional[ImagePopup] = None
+
+    def set_preview(self, pixmap: QPixmap, title: str = "Preview") -> None:
+        """Store full pixmap and show scaled thumbnail."""
+        self._full_pixmap = pixmap
+        self._popup_title = title
+        self._update_thumbnail()
+        # Live-update the open popup if it still exists
+        if self._popup is not None and self._popup.isVisible():
+            self._popup._source_pixmap = pixmap
+            self._popup._apply_zoom()
+
+    def _update_thumbnail(self) -> None:
+        if self._full_pixmap is None:
+            return
+        scaled = self._full_pixmap.scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        )
+        self.setPixmap(scaled)
+
+    def resizeEvent(self, event):  # noqa: N802
+        super().resizeEvent(event)
+        self._update_thumbnail()
+
+    def mousePressEvent(self, event):  # noqa: N802
+        if self._full_pixmap is not None:
+            # Non-modal: .show() instead of .exec()
+            self._popup = ImagePopup(
+                self._full_pixmap, self._popup_title, self.window())
+            self._popup.show()
+        self.clicked.emit()
+
+
+# ═════════════════════════════════════════════════════════════════════
+#  WORKER — dataset generation on QThread
 # ═════════════════════════════════════════════════════════════════════
 
 class _WorkerSignals(QObject):
-    """Signals emitted by the dataset generation worker."""
-    tool_started   = Signal(int, str)          # tool_index, tool_name
-    frame_done     = Signal(int, int)          # frame_index, n_frames
-    tool_done      = Signal(int, int)          # tool_index, n_tools
-    log            = Signal(str)               # free-text log line
-    preview_ready  = Signal(object)            # numpy RGB array
+    tool_started   = Signal(int, str)
+    frame_done     = Signal(int, int)
+    tool_done      = Signal(int, int)
+    log            = Signal(str)
+    preview_ready  = Signal(object)          # numpy array
     finished       = Signal()
     error          = Signal(str)
 
 
 class DatasetWorker(QThread):
-    """
-    Heavy-lifting thread: for each CAD file, load → preprocess → render
-    360 frames.  Optionally apply noise per frame and save both clean
-    and noisy masks.
-
-    All VTK / PyVista calls happen inside *this* thread (OpenGL context
-    is created here and stays here).
-    """
-
     sig = _WorkerSignals()
 
     def __init__(
@@ -91,20 +220,18 @@ class DatasetWorker(QThread):
         apply_noise: bool,
     ):
         super().__init__()
-        self.model_paths     = model_paths
+        self.model_paths      = model_paths
         self.clean_output_dir = clean_output_dir
         self.noisy_output_dir = noisy_output_dir
-        self.render_cfg      = render_cfg
-        self.noise_cfg       = noise_cfg
-        self.apply_noise     = apply_noise
-        self._abort          = False
+        self.render_cfg       = render_cfg
+        self.noise_cfg        = noise_cfg
+        self.apply_noise      = apply_noise
+        self._abort           = False
 
-    # ── public abort handle ──────────────────────────────────────────
     def abort(self) -> None:
         self._abort = True
 
-    # ── thread entry point ───────────────────────────────────────────
-    def run(self) -> None:  # noqa: C901  (complex but linear)
+    def run(self) -> None:
         import pyvista as pv
         import vtk
         from PIL import Image
@@ -114,12 +241,12 @@ class DatasetWorker(QThread):
             rc = self.render_cfg
             nc = self.noise_cfg
 
-            img_w = int(rc["img_w"])
-            img_h = int(rc["img_h"])
-            n_frames = int(rc["n_frames"])
+            img_w  = int(rc["img_w"])
+            img_h  = int(rc["img_h"])
+            n_frames     = int(rc["n_frames"])
             tip_from_top = float(rc["tip_from_top"])
             working_dist = float(rc["working_distance"])
-            img_format = rc["image_format"].strip().upper()
+            img_format   = rc["image_format"].strip().upper()
             ext = "png" if img_format == "PNG" else "tiff"
 
             for ti, model_path in enumerate(self.model_paths):
@@ -129,25 +256,20 @@ class DatasetWorker(QThread):
 
                 tool_name = RE.get_tool_name(model_path)
                 self.sig.tool_started.emit(ti, tool_name)
-                self.sig.log.emit(f"── Tool {ti + 1}/{n_tools}: {tool_name} ──")
+                self.sig.log.emit(f"── Tool {ti+1}/{n_tools}: {tool_name} ──")
 
-                # ① Load
                 self.sig.log.emit(f"[LOAD] {Path(model_path).name}")
                 mesh = RE.load_mesh(model_path)
-
-                # ② Preprocess
                 mesh, tip_z, top_z, max_r = RE.preprocess_mesh(mesh)
 
-                # ③ Camera — override globals temporarily
-                orig_wd = RE.WORKING_DISTANCE_MM
+                orig_wd  = RE.WORKING_DISTANCE_MM
                 orig_tip = RE.TIP_FROM_TOP
                 RE.WORKING_DISTANCE_MM = working_dist
-                RE.TIP_FROM_TOP = tip_from_top
+                RE.TIP_FROM_TOP        = tip_from_top
                 cam = RE.compute_camera(tip_z, top_z, max_r)
                 RE.WORKING_DISTANCE_MM = orig_wd
-                RE.TIP_FROM_TOP = orig_tip
+                RE.TIP_FROM_TOP        = orig_tip
 
-                # ④ Off-screen plotter (created per tool for a fresh GL ctx)
                 pv.OFF_SCREEN = True
                 plotter = pv.Plotter(off_screen=True,
                                      window_size=[img_w, img_h])
@@ -167,7 +289,6 @@ class DatasetWorker(QThread):
                     noisy_dir = Path(self.noisy_output_dir) / tool_name
                     noisy_dir.mkdir(parents=True, exist_ok=True)
 
-                # ⑤ Frame loop
                 for angle in range(n_frames):
                     if self._abort:
                         break
@@ -177,27 +298,25 @@ class DatasetWorker(QThread):
                     actor.SetUserTransform(xform)
 
                     plotter.render()
-                    rgb = plotter.screenshot(return_img=True)
+                    rgb  = plotter.screenshot(return_img=True)
                     mask = RE._to_binary_mask(rgb)
 
-                    # Save clean mask
                     clean_path = str(clean_dir / f"mask_{angle:03d}.{ext}")
-                    Image.fromarray(mask, mode="L").save(clean_path,
-                                                         format=img_format)
+                    Image.fromarray(mask, mode="L").save(
+                        clean_path, format=img_format)
 
-                    # Optionally apply noise & save
                     if self.apply_noise and noisy_dir is not None:
                         noisy = NI.inject_noise(
                             mask,
-                            edge_width=int(nc["edge_width"]),
-                            blur_sigma=float(nc["blur_sigma"]),
-                            flip_probability=float(nc["flip_prob"]),
-                            flip_enabled=bool(nc["flip_enabled"]),
+                            n_dents=int(nc["n_dents"]),
+                            dent_span_min=int(nc["dent_span_min"]),
+                            dent_span_max=int(nc["dent_span_max"]),
+                            max_depth=float(nc["max_depth"]),
                             seed=nc.get("seed"),
                         )
                         noisy_path = str(noisy_dir / f"mask_{angle:03d}.{ext}")
-                        Image.fromarray(noisy, mode="L").save(noisy_path,
-                                                               format=img_format)
+                        Image.fromarray(noisy, mode="L").save(
+                            noisy_path, format=img_format)
 
                     self.sig.frame_done.emit(angle + 1, n_frames)
 
@@ -205,7 +324,6 @@ class DatasetWorker(QThread):
                 self.sig.tool_done.emit(ti + 1, n_tools)
 
             self.sig.log.emit("[DONE] Dataset generation complete.")
-
         except Exception:
             self.sig.error.emit(traceback.format_exc())
         finally:
@@ -213,8 +331,7 @@ class DatasetWorker(QThread):
 
 
 class PreviewWorker(QThread):
-    """Render a single debug frame and send it back as a numpy RGB array."""
-
+    """Render a single debug frame for the render tab preview."""
     sig = _WorkerSignals()
 
     def __init__(self, model_path: str, render_cfg: Dict[str, Any]):
@@ -224,25 +341,24 @@ class PreviewWorker(QThread):
 
     def run(self) -> None:
         import pyvista as pv
-        import vtk
 
         try:
             rc = self.render_cfg
-            img_w = int(rc["img_w"])
-            img_h = int(rc["img_h"])
+            img_w  = int(rc["img_w"])
+            img_h  = int(rc["img_h"])
             tip_from_top = float(rc["tip_from_top"])
             working_dist = float(rc["working_distance"])
 
             mesh = RE.load_mesh(self.model_path)
             mesh, tip_z, top_z, max_r = RE.preprocess_mesh(mesh)
 
-            orig_wd = RE.WORKING_DISTANCE_MM
+            orig_wd  = RE.WORKING_DISTANCE_MM
             orig_tip = RE.TIP_FROM_TOP
             RE.WORKING_DISTANCE_MM = working_dist
-            RE.TIP_FROM_TOP = tip_from_top
+            RE.TIP_FROM_TOP        = tip_from_top
             cam = RE.compute_camera(tip_z, top_z, max_r)
             RE.WORKING_DISTANCE_MM = orig_wd
-            RE.TIP_FROM_TOP = orig_tip
+            RE.TIP_FROM_TOP        = orig_tip
 
             pv.OFF_SCREEN = True
             plotter = pv.Plotter(off_screen=True,
@@ -261,7 +377,74 @@ class PreviewWorker(QThread):
 
             self.sig.preview_ready.emit(rgb)
             self.sig.log.emit("[DEBUG] Preview rendered.")
+        except Exception:
+            self.sig.error.emit(traceback.format_exc())
+        finally:
+            self.sig.finished.emit()
 
+
+class NoiseBatchWorker(QThread):
+    """Standalone thread: apply noise to every mask in a folder."""
+    sig = _WorkerSignals()
+
+    def __init__(
+        self,
+        input_dir: str,
+        output_dir: str,
+        noise_cfg: Dict[str, Any],
+    ):
+        super().__init__()
+        self.input_dir  = input_dir
+        self.output_dir = output_dir
+        self.noise_cfg  = noise_cfg
+        self._abort     = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        from PIL import Image
+
+        try:
+            nc  = self.noise_cfg
+            inp = Path(self.input_dir)
+            out = Path(self.output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+
+            files = sorted(
+                f for f in inp.iterdir()
+                if f.suffix.lower() in (".png", ".tiff", ".tif")
+            )
+            if not files:
+                self.sig.log.emit(f"[NOISE] No image files in {inp}")
+                return
+
+            total = len(files)
+            self.sig.log.emit(
+                f"[NOISE] Processing {total} masks: {inp} → {out}")
+
+            for i, src in enumerate(files):
+                if self._abort:
+                    self.sig.log.emit("[ABORT] Noise batch cancelled.")
+                    break
+
+                img = np.array(
+                    Image.open(src).convert("L"), dtype=np.uint8)
+                img = np.where(img > 127, 255, 0).astype(np.uint8)
+
+                noisy = NI.inject_noise(
+                    img,
+                    n_dents=int(nc["n_dents"]),
+                    dent_span_min=int(nc["dent_span_min"]),
+                    dent_span_max=int(nc["dent_span_max"]),
+                    max_depth=float(nc["max_depth"]),
+                    seed=nc.get("seed"),
+                )
+                dst = out / src.name
+                Image.fromarray(noisy, mode="L").save(str(dst), format="PNG")
+                self.sig.frame_done.emit(i + 1, total)
+
+            self.sig.log.emit("[DONE] Noise batch complete.")
         except Exception:
             self.sig.error.emit(traceback.format_exc())
         finally:
@@ -273,7 +456,6 @@ class PreviewWorker(QThread):
 # ═════════════════════════════════════════════════════════════════════
 
 def _apply_dark_theme(app: QApplication) -> None:
-    """Fusion + custom dark palette."""
     app.setStyle("Fusion")
     p = QPalette()
     p.setColor(QPalette.Window,          QColor(30, 30, 30))
@@ -301,16 +483,19 @@ def _apply_dark_theme(app: QApplication) -> None:
 # ═════════════════════════════════════════════════════════════════════
 
 class SimulationGUI(QMainWindow):
-    """Top-level window: tabs, progress, log, generate button."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Sim2Real Mask Generator")
-        self.setMinimumSize(900, 740)
-        self.resize(1040, 820)
+        self.setMinimumSize(960, 780)
+        self.resize(1080, 880)
 
         self._worker: Optional[DatasetWorker] = None
         self._preview_worker: Optional[PreviewWorker] = None
+        self._noise_batch_worker: Optional[NoiseBatchWorker] = None
+
+        # Cached sample mask for live noise preview
+        self._sample_mask: Optional[np.ndarray] = None
 
         self._build_ui()
 
@@ -329,19 +514,7 @@ class SimulationGUI(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_render_tab(), "⚙  Render")
         self.tabs.addTab(self._build_noise_tab(),  "🔊  Noise")
-        root.addWidget(self.tabs, stretch=0)
-
-        # ── Preview area ─────────────────────────────────────────────
-        preview_group = QGroupBox("Debug Preview")
-        preview_lay = QVBoxLayout(preview_group)
-        self.preview_label = QLabel("No preview yet.  Select a CAD file and click Debug Preview.")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setMinimumHeight(180)
-        self.preview_label.setStyleSheet(
-            "background-color: #111; border: 1px solid #333; border-radius: 4px;"
-        )
-        preview_lay.addWidget(self.preview_label)
-        root.addWidget(preview_group, stretch=1)
+        root.addWidget(self.tabs, stretch=1)
 
         # ── Progress bars ────────────────────────────────────────────
         prog_group = QGroupBox("Progress")
@@ -362,17 +535,18 @@ class SimulationGUI(QMainWindow):
         root.addWidget(prog_group)
 
         # ── Log console ──────────────────────────────────────────────
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumHeight(120)
-        self.log.setStyleSheet(
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        self.log_box.setMaximumHeight(110)
+        self.log_box.setStyleSheet(
             "background-color: #111; color: #9acd32; "
             "font-family: Consolas, monospace; font-size: 11px;"
         )
-        root.addWidget(self.log)
+        root.addWidget(self.log_box)
 
         # ── Buttons row ──────────────────────────────────────────────
         btn_row = QHBoxLayout()
+
         self.btn_generate = QPushButton("  Generate Dataset  ")
         self.btn_generate.setMinimumHeight(48)
         self.btn_generate.setStyleSheet(
@@ -398,7 +572,7 @@ class SimulationGUI(QMainWindow):
 
         root.addLayout(btn_row)
 
-    # ── Render tab ───────────────────────────────────────────────────
+    # ── RENDER TAB ───────────────────────────────────────────────────
 
     def _build_render_tab(self) -> QWidget:
         tab = QWidget()
@@ -410,17 +584,17 @@ class SimulationGUI(QMainWindow):
         fg_lay = QVBoxLayout(file_group)
         self.file_list = QListWidget()
         self.file_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.file_list.setMinimumHeight(70)
-        self.file_list.setMaximumHeight(120)
+        self.file_list.setMinimumHeight(60)
+        self.file_list.setMaximumHeight(100)
         fg_lay.addWidget(self.file_list)
-        btn_row = QHBoxLayout()
+        fbtn = QHBoxLayout()
         btn_add = QPushButton("Add Files …")
         btn_add.clicked.connect(self._add_cad_files)
-        btn_remove = QPushButton("Remove Selected")
-        btn_remove.clicked.connect(self._remove_cad_files)
-        btn_row.addWidget(btn_add)
-        btn_row.addWidget(btn_remove)
-        fg_lay.addLayout(btn_row)
+        btn_rem = QPushButton("Remove Selected")
+        btn_rem.clicked.connect(self._remove_cad_files)
+        fbtn.addWidget(btn_add)
+        fbtn.addWidget(btn_rem)
+        fg_lay.addLayout(fbtn)
         lay.addWidget(file_group)
 
         # --- Output directory ---
@@ -428,9 +602,10 @@ class SimulationGUI(QMainWindow):
         og_lay = QHBoxLayout(out_group)
         self.render_out_edit = QLineEdit(str(_SCRIPT_DIR / "output"))
         og_lay.addWidget(self.render_out_edit, stretch=1)
-        btn_browse = QPushButton("Browse …")
-        btn_browse.clicked.connect(lambda: self._browse_dir(self.render_out_edit))
-        og_lay.addWidget(btn_browse)
+        btn_br = QPushButton("Browse …")
+        btn_br.clicked.connect(
+            lambda: self._browse_dir(self.render_out_edit))
+        og_lay.addWidget(btn_br)
         lay.addWidget(out_group)
 
         # --- Camera / render params ---
@@ -480,9 +655,21 @@ class SimulationGUI(QMainWindow):
 
         lay.addWidget(cam_group)
 
-        # --- Debug preview button ---
+        # --- Debug preview (clickable → full-res popup) ---
+        prev_group = QGroupBox(
+            "Render Preview  (click image to expand full-resolution)")
+        prev_lay = QVBoxLayout(prev_group)
+        self.render_preview = ClickablePreview(
+            "No preview yet.  Select a CAD file and click Debug Preview.")
+        self.render_preview.setMinimumHeight(160)
+        self.render_preview.setStyleSheet(
+            "background-color: #111; border: 1px solid #333; "
+            "border-radius: 4px;"
+        )
+        prev_lay.addWidget(self.render_preview)
+
         self.btn_debug = QPushButton("  Debug Preview (selected file)  ")
-        self.btn_debug.setMinimumHeight(36)
+        self.btn_debug.setMinimumHeight(34)
         self.btn_debug.setStyleSheet(
             "QPushButton { background-color: #1a4a6b; color: white; "
             "font-size: 13px; border-radius: 5px; }"
@@ -490,85 +677,205 @@ class SimulationGUI(QMainWindow):
             "QPushButton:disabled { background-color: #333; color: #666; }"
         )
         self.btn_debug.clicked.connect(self._on_debug_preview)
-        lay.addWidget(self.btn_debug)
+        prev_lay.addWidget(self.btn_debug)
+        lay.addWidget(prev_group, stretch=1)
 
-        lay.addStretch()
         return tab
 
-    # ── Noise tab ────────────────────────────────────────────────────
+    # ── NOISE TAB ────────────────────────────────────────────────────
 
     def _build_noise_tab(self) -> QWidget:
-        tab = QWidget()
-        lay = QVBoxLayout(tab)
+        # Wrap everything in a QScrollArea so it works on small monitors
+        tab = QScrollArea()
+        tab.setWidgetResizable(True)
+        tab.setFrameShape(QScrollArea.NoFrame)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
         lay.setSpacing(8)
 
-        # --- Enable / Disable noise ---
-        self.chk_noise = QCheckBox("Apply noise to rendered masks")
+        # --- Enable / disable during dataset generation ---
+        self.chk_noise = QCheckBox(
+            "Apply noise during dataset generation (Render tab)")
         self.chk_noise.setChecked(True)
         self.chk_noise.setStyleSheet("font-size: 13px; font-weight: bold;")
         lay.addWidget(self.chk_noise)
 
-        # --- Noisy output dir ---
-        nout_group = QGroupBox("Output Directory (noisy masks)")
+        # --- Noisy output dir (used by Generate Dataset) ---
+        nout_group = QGroupBox("Noisy Output Directory (dataset generation)")
         no_lay = QHBoxLayout(nout_group)
         self.noisy_out_edit = QLineEdit(str(_SCRIPT_DIR / "output_noisy"))
         no_lay.addWidget(self.noisy_out_edit, stretch=1)
-        btn_browse_n = QPushButton("Browse …")
-        btn_browse_n.clicked.connect(
+        btn_bn = QPushButton("Browse …")
+        btn_bn.clicked.connect(
             lambda: self._browse_dir(self.noisy_out_edit))
-        no_lay.addWidget(btn_browse_n)
+        no_lay.addWidget(btn_bn)
         lay.addWidget(nout_group)
 
         # --- Noise parameters ---
-        noise_group = QGroupBox("Noise Parameters")
+        noise_group = QGroupBox("Dent Parameters (localised contour erosion)")
         form = QFormLayout(noise_group)
 
-        self.spin_edge_w = QSpinBox()
-        self.spin_edge_w.setRange(1, 50)
-        self.spin_edge_w.setValue(NI.EDGE_WIDTH)
-        self.spin_edge_w.setSuffix("  px")
-        self.spin_edge_w.setToolTip(
-            "Half-width of the boundary band where noise is applied.\n"
-            "Larger = wider noisy border."
+        self.spin_n_dents = QSpinBox()
+        self.spin_n_dents.setRange(0, 30)
+        self.spin_n_dents.setValue(NI.N_DENTS)
+        self.spin_n_dents.setToolTip(
+            "Number of independent erosion patches along the contour.\n"
+            "0 = no dents (clean mask)."
         )
-        form.addRow("Edge Width:", self.spin_edge_w)
+        form.addRow("Number of Dents:", self.spin_n_dents)
 
-        self.spin_blur = QDoubleSpinBox()
-        self.spin_blur.setRange(0.0, 10.0)
-        self.spin_blur.setValue(NI.BLUR_SIGMA)
-        self.spin_blur.setSingleStep(0.1)
-        self.spin_blur.setDecimals(2)
-        self.spin_blur.setToolTip(
-            "Gaussian sigma for edge-aliasing blur.\n"
-            "0 = no blur,  0.5–1.0 = subtle,  1.5–2.5 = visible."
+        self.spin_span_min = QSpinBox()
+        self.spin_span_min.setRange(10, 1000)
+        self.spin_span_min.setValue(NI.DENT_SPAN_MIN)
+        self.spin_span_min.setSuffix("  contour px")
+        self.spin_span_min.setToolTip(
+            "Minimum arc length (in contour pixels) of each dent."
         )
-        form.addRow("Blur Sigma (σ):", self.spin_blur)
+        form.addRow("Span Min:", self.spin_span_min)
 
-        self.chk_flip = QCheckBox("Enable specular-flip noise")
-        self.chk_flip.setChecked(NI.FLIP_ENABLED)
-        form.addRow("Specular Flip:", self.chk_flip)
-
-        self.spin_flip_prob = QDoubleSpinBox()
-        self.spin_flip_prob.setRange(0.0, 1.0)
-        self.spin_flip_prob.setValue(NI.FLIP_PROB)
-        self.spin_flip_prob.setSingleStep(0.005)
-        self.spin_flip_prob.setDecimals(3)
-        self.spin_flip_prob.setToolTip(
-            "Per-pixel probability of white↔black flip in boundary zone.\n"
-            "0.01 = subtle,  0.05 = moderate,  0.10 = aggressive."
+        self.spin_span_max = QSpinBox()
+        self.spin_span_max.setRange(10, 2000)
+        self.spin_span_max.setValue(NI.DENT_SPAN_MAX)
+        self.spin_span_max.setSuffix("  contour px")
+        self.spin_span_max.setToolTip(
+            "Maximum arc length (in contour pixels) of each dent."
         )
-        form.addRow("Flip Probability:", self.spin_flip_prob)
+        form.addRow("Span Max:", self.spin_span_max)
+
+        self.spin_max_depth = QDoubleSpinBox()
+        self.spin_max_depth.setRange(0.5, 10.0)
+        self.spin_max_depth.setValue(NI.MAX_DEPTH)
+        self.spin_max_depth.setSingleStep(0.5)
+        self.spin_max_depth.setDecimals(1)
+        self.spin_max_depth.setSuffix("  px")
+        self.spin_max_depth.setToolTip(
+            "Maximum inward erosion depth per dent (pixels).\n"
+            "Each dent picks a random depth in [1.0, max_depth].\n"
+            "1–2 = subtle,  2–3 = visible,  3+ = aggressive."
+        )
+        form.addRow("Max Depth:", self.spin_max_depth)
 
         self.spin_seed = QSpinBox()
         self.spin_seed.setRange(-1, 2_147_483_647)
         self.spin_seed.setValue(-1)
-        self.spin_seed.setToolTip(
-            "RNG seed for reproducible noise.  -1 = non-deterministic."
-        )
+        self.spin_seed.setToolTip("RNG seed.  -1 = non-deterministic.")
         form.addRow("Seed (-1 = random):", self.spin_seed)
 
         lay.addWidget(noise_group)
-        lay.addStretch()
+
+        # --- Live before / after preview ---
+        prev_group = QGroupBox(
+            "Noise Preview  (click either image to expand full-resolution)")
+        prev_lay = QVBoxLayout(prev_group)
+
+        # Load sample mask button
+        load_row = QHBoxLayout()
+        self.btn_load_mask = QPushButton("Load Sample Mask …")
+        self.btn_load_mask.setToolTip(
+            "Pick any clean binary mask PNG/TIFF to preview noise on.")
+        self.btn_load_mask.clicked.connect(self._on_load_sample_mask)
+        self.noise_mask_path_label = QLabel("No mask loaded")
+        self.noise_mask_path_label.setStyleSheet("color: #888;")
+        load_row.addWidget(self.btn_load_mask)
+        load_row.addWidget(self.noise_mask_path_label, stretch=1)
+        prev_lay.addLayout(load_row)
+
+        # Side-by-side: Original | Noisy
+        side = QHBoxLayout()
+
+        orig_box = QVBoxLayout()
+        orig_title = QLabel("Original (clean)")
+        orig_title.setAlignment(Qt.AlignCenter)
+        orig_title.setStyleSheet("font-weight: bold; color: #aaa;")
+        orig_box.addWidget(orig_title)
+        self.noise_orig_preview = ClickablePreview("—")
+        self.noise_orig_preview.setMinimumHeight(140)
+        self.noise_orig_preview.setStyleSheet(
+            "background-color: #111; border: 1px solid #333; "
+            "border-radius: 4px;"
+        )
+        orig_box.addWidget(self.noise_orig_preview, stretch=1)
+        side.addLayout(orig_box)
+
+        noisy_box = QVBoxLayout()
+        noisy_title = QLabel("After noise")
+        noisy_title.setAlignment(Qt.AlignCenter)
+        noisy_title.setStyleSheet("font-weight: bold; color: #aaa;")
+        noisy_box.addWidget(noisy_title)
+        self.noise_result_preview = ClickablePreview("—")
+        self.noise_result_preview.setMinimumHeight(140)
+        self.noise_result_preview.setStyleSheet(
+            "background-color: #111; border: 1px solid #333; "
+            "border-radius: 4px;"
+        )
+        noisy_box.addWidget(self.noise_result_preview, stretch=1)
+        side.addLayout(noisy_box)
+
+        prev_lay.addLayout(side, stretch=1)
+        lay.addWidget(prev_group, stretch=1)
+
+        # Connect every noise param widget to live preview update
+        self.spin_n_dents.valueChanged.connect(self._update_noise_preview)
+        self.spin_span_min.valueChanged.connect(self._update_noise_preview)
+        self.spin_span_max.valueChanged.connect(self._update_noise_preview)
+        self.spin_max_depth.valueChanged.connect(self._update_noise_preview)
+        self.spin_seed.valueChanged.connect(self._update_noise_preview)
+
+        # ── Standalone batch section ─────────────────────────────────
+        batch_group = QGroupBox("Standalone Batch — Apply Noise to Folder")
+        bg_lay = QVBoxLayout(batch_group)
+
+        dir_row = QGridLayout()
+        dir_row.addWidget(QLabel("Input folder:"), 0, 0)
+        self.noise_batch_in = QLineEdit(str(_SCRIPT_DIR / "output"))
+        dir_row.addWidget(self.noise_batch_in, 0, 1)
+        btn_bi = QPushButton("Browse …")
+        btn_bi.clicked.connect(
+            lambda: self._browse_dir(self.noise_batch_in))
+        dir_row.addWidget(btn_bi, 0, 2)
+
+        dir_row.addWidget(QLabel("Output folder:"), 1, 0)
+        self.noise_batch_out = QLineEdit(str(_SCRIPT_DIR / "output_noisy"))
+        dir_row.addWidget(self.noise_batch_out, 1, 1)
+        btn_bo = QPushButton("Browse …")
+        btn_bo.clicked.connect(
+            lambda: self._browse_dir(self.noise_batch_out))
+        dir_row.addWidget(btn_bo, 1, 2)
+        bg_lay.addLayout(dir_row)
+
+        self.prog_noise_batch = QProgressBar()
+        self.prog_noise_batch.setTextVisible(True)
+        self.prog_noise_batch.setFormat("%v / %m  masks")
+        bg_lay.addWidget(self.prog_noise_batch)
+
+        nbtn_row = QHBoxLayout()
+        self.btn_noise_batch = QPushButton("  Process Folder  ")
+        self.btn_noise_batch.setMinimumHeight(36)
+        self.btn_noise_batch.setStyleSheet(
+            "QPushButton { background-color: #5a3a8a; color: white; "
+            "font-size: 13px; font-weight: bold; border-radius: 5px; }"
+            "QPushButton:hover { background-color: #7244b0; }"
+            "QPushButton:disabled { background-color: #333; color: #666; }"
+        )
+        self.btn_noise_batch.clicked.connect(self._on_noise_batch)
+        nbtn_row.addWidget(self.btn_noise_batch)
+
+        self.btn_noise_batch_abort = QPushButton("Abort")
+        self.btn_noise_batch_abort.setEnabled(False)
+        self.btn_noise_batch_abort.setMinimumHeight(36)
+        self.btn_noise_batch_abort.setStyleSheet(
+            "QPushButton { background-color: #8b1a1a; color: white; "
+            "font-size: 12px; border-radius: 5px; }"
+            "QPushButton:hover { background-color: #b22222; }"
+            "QPushButton:disabled { background-color: #333; color: #666; }"
+        )
+        self.btn_noise_batch_abort.clicked.connect(self._on_noise_batch_abort)
+        nbtn_row.addWidget(self.btn_noise_batch_abort)
+        bg_lay.addLayout(nbtn_row)
+
+        lay.addWidget(batch_group)
+
+        tab.setWidget(inner)
         return tab
 
     # ─────────────────────────────────────────────────────────────────
@@ -610,17 +917,16 @@ class SimulationGUI(QMainWindow):
     def _collect_noise_cfg(self) -> Dict[str, Any]:
         seed_val = self.spin_seed.value()
         return dict(
-            edge_width=self.spin_edge_w.value(),
-            blur_sigma=self.spin_blur.value(),
-            flip_prob=self.spin_flip_prob.value(),
-            flip_enabled=self.chk_flip.isChecked(),
+            n_dents=self.spin_n_dents.value(),
+            dent_span_min=self.spin_span_min.value(),
+            dent_span_max=self.spin_span_max.value(),
+            max_depth=self.spin_max_depth.value(),
             seed=None if seed_val < 0 else seed_val,
         )
 
     def _log(self, text: str) -> None:
-        self.log.append(text)
-        # Auto-scroll
-        sb = self.log.verticalScrollBar()
+        self.log_box.append(text)
+        sb = self.log_box.verticalScrollBar()
         sb.setValue(sb.maximum())
 
     def _set_busy(self, busy: bool) -> None:
@@ -630,7 +936,7 @@ class SimulationGUI(QMainWindow):
         self.tabs.setEnabled(not busy)
 
     # ─────────────────────────────────────────────────────────────────
-    #  DEBUG PREVIEW
+    #  RENDER DEBUG PREVIEW
     # ─────────────────────────────────────────────────────────────────
 
     @Slot()
@@ -641,18 +947,18 @@ class SimulationGUI(QMainWindow):
                 QMessageBox.warning(self, "No files",
                                     "Add at least one CAD file first.")
                 return
-            # Use first file if none selected
             model_path = self.file_list.item(0).text()
         else:
             model_path = sel[0].text()
 
         self.btn_debug.setEnabled(False)
-        self.preview_label.setText("Rendering preview …")
+        self.render_preview.setText("Rendering preview …")
         self._log(f"[DEBUG] Rendering preview for {Path(model_path).name} …")
 
-        self._preview_worker = PreviewWorker(model_path,
-                                             self._collect_render_cfg())
-        self._preview_worker.sig.preview_ready.connect(self._show_preview)
+        self._preview_worker = PreviewWorker(
+            model_path, self._collect_render_cfg())
+        self._preview_worker.sig.preview_ready.connect(
+            self._show_render_preview)
         self._preview_worker.sig.log.connect(self._log)
         self._preview_worker.sig.error.connect(self._on_error)
         self._preview_worker.sig.finished.connect(
@@ -660,19 +966,103 @@ class SimulationGUI(QMainWindow):
         self._preview_worker.start()
 
     @Slot(object)
-    def _show_preview(self, rgb: np.ndarray) -> None:
-        h, w, ch = rgb.shape
-        bytes_per_line = ch * w
-        qimg = QImage(rgb.data.tobytes(), w, h, bytes_per_line,
-                      QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg)
-        # Scale to fit the label while keeping aspect ratio
-        scaled = pixmap.scaled(
-            self.preview_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
+    def _show_render_preview(self, rgb: np.ndarray) -> None:
+        pm = _rgb_to_pixmap(rgb)
+        self.render_preview.set_preview(pm, "Render Preview (full resolution)")
+
+    # ─────────────────────────────────────────────────────────────────
+    #  NOISE LIVE PREVIEW
+    # ─────────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_load_sample_mask(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select a clean binary mask",
+            str(_SCRIPT_DIR / "output"),
+            "Images (*.png *.tiff *.tif);;All Files (*)",
         )
-        self.preview_label.setPixmap(scaled)
+        if not path:
+            return
+
+        from PIL import Image
+        img = np.array(Image.open(path).convert("L"), dtype=np.uint8)
+        img = np.where(img > 127, 255, 0).astype(np.uint8)
+        self._sample_mask = img
+
+        name = Path(path).name
+        self.noise_mask_path_label.setText(name)
+        self._log(f"[NOISE] Loaded sample mask: {name}")
+
+        # Show original
+        pm_orig = _gray_to_pixmap(img)
+        self.noise_orig_preview.set_preview(pm_orig, f"Original — {name}")
+
+        # Apply current noise and show result
+        self._update_noise_preview()
+
+    @Slot()
+    def _update_noise_preview(self) -> None:
+        """Re-apply noise with current GUI params to the cached sample mask."""
+        if self._sample_mask is None:
+            return
+
+        nc = self._collect_noise_cfg()
+        noisy = NI.inject_noise(
+            self._sample_mask,
+            n_dents=int(nc["n_dents"]),
+            dent_span_min=int(nc["dent_span_min"]),
+            dent_span_max=int(nc["dent_span_max"]),
+            max_depth=float(nc["max_depth"]),
+            seed=nc.get("seed"),
+        )
+
+        pm = _gray_to_pixmap(noisy)
+        self.noise_result_preview.set_preview(pm, "Noisy result")
+
+    # ─────────────────────────────────────────────────────────────────
+    #  STANDALONE NOISE BATCH
+    # ─────────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _on_noise_batch(self) -> None:
+        inp = self.noise_batch_in.text().strip()
+        out = self.noise_batch_out.text().strip()
+        if not inp or not Path(inp).is_dir():
+            QMessageBox.warning(
+                self, "Invalid input",
+                "Select a valid input folder containing mask images.")
+            return
+
+        self.btn_noise_batch.setEnabled(False)
+        self.btn_noise_batch_abort.setEnabled(True)
+        self.prog_noise_batch.setValue(0)
+
+        self._noise_batch_worker = NoiseBatchWorker(
+            inp, out, self._collect_noise_cfg())
+        self._noise_batch_worker.sig.frame_done.connect(
+            self._on_noise_batch_progress)
+        self._noise_batch_worker.sig.log.connect(self._log)
+        self._noise_batch_worker.sig.error.connect(self._on_error)
+        self._noise_batch_worker.sig.finished.connect(
+            self._on_noise_batch_finished)
+        self._noise_batch_worker.start()
+
+    @Slot()
+    def _on_noise_batch_abort(self) -> None:
+        if self._noise_batch_worker is not None:
+            self._noise_batch_worker.abort()
+            self._log("[USER] Noise batch abort requested …")
+
+    @Slot(int, int)
+    def _on_noise_batch_progress(self, done: int, total: int) -> None:
+        self.prog_noise_batch.setMaximum(total)
+        self.prog_noise_batch.setValue(done)
+
+    @Slot()
+    def _on_noise_batch_finished(self) -> None:
+        self.btn_noise_batch.setEnabled(True)
+        self.btn_noise_batch_abort.setEnabled(False)
+        self._log("── Noise batch finished ──")
 
     # ─────────────────────────────────────────────────────────────────
     #  GENERATE DATASET
@@ -691,7 +1081,6 @@ class SimulationGUI(QMainWindow):
         nc = self._collect_noise_cfg()
         apply_noise = self.chk_noise.isChecked()
 
-        # Reset progress bars
         self.prog_tools.setMaximum(n)
         self.prog_tools.setValue(0)
         self.prog_frames.setMaximum(int(rc["n_frames"]))
@@ -727,8 +1116,7 @@ class SimulationGUI(QMainWindow):
     @Slot(int, str)
     def _on_tool_started(self, idx: int, name: str) -> None:
         self.prog_frames.setValue(0)
-        n_frames = self.spin_frames.value()
-        self.prog_frames.setMaximum(n_frames)
+        self.prog_frames.setMaximum(self.spin_frames.value())
 
     @Slot(int, int)
     def _on_frame_done(self, done: int, total: int) -> None:
@@ -741,7 +1129,8 @@ class SimulationGUI(QMainWindow):
     @Slot(str)
     def _on_error(self, tb: str) -> None:
         self._log(f"[ERROR]\n{tb}")
-        QMessageBox.critical(self, "Error", f"An error occurred:\n\n{tb[:600]}")
+        QMessageBox.critical(self, "Error",
+                             f"An error occurred:\n\n{tb[:600]}")
 
     @Slot()
     def _on_finished(self) -> None:

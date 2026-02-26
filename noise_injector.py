@@ -1,30 +1,40 @@
 #!/usr/bin/env python3
 """
-noise_injector.py — Realistic Edge-Noise Injector for Binary Sim Masks
-========================================================================
+noise_injector.py — Localized Contour-Dent Noise for Binary Sim Masks
+======================================================================
 
 Takes a perfectly clean binary mask (numpy uint8, 0/255) rendered by
-``render_engine.py`` and degrades it to look like it was segmented from
-a real camera frame captured on a metallic drill under a VS-LDV75 lens.
+``render_engine.py`` and degrades it to look like it was segmented via
+background removal from a real camera frame.
 
-Noise Pipeline (all applied **only** within a narrow band around the
-silhouette boundary — the solid interior and background are untouched):
+Real-world artefact being simulated
+------------------------------------
+Background-subtraction segmentation sometimes slightly under-segments:
+the mask boundary sits a few pixels *inside* the true tool edge.  This
+does NOT happen uniformly — it occurs in **localised patches** of
+~100-200 contour pixels, creating small smooth dents/erosions along the
+edge.  When these masks are used for 3-D reconstruction the dents
+produce small surface indentations that gradually fade out.
 
-    1. **Edge aliasing**   — Gaussian blur on the boundary zone followed
-       by re-thresholding, producing sub-pixel jaggedness that mimics a
-       real sensor grid.
+Noise Pipeline
+--------------
+    1. Find the main contour of the binary mask.
+    2. Pick ``n_dents`` random contiguous segments along the contour,
+       each spanning ``dent_span_min``–``dent_span_max`` contour pixels.
+    3. For each segment, assign a random erosion depth (1–``max_depth``
+       pixels) with a smooth cosine-window falloff at both ends.
+    4. Use ``cv2.distanceTransform`` to determine each foreground
+       pixel's distance from the boundary.
+    5. Erode (set to 0) every foreground pixel whose distance to the
+       edge is **less than** the local dent depth.
 
-    2. **Specular-flip noise** — Random pixel flips (white↔black) along
-       the boundary zone to simulate segmentation failures caused by
-       shiny metallic reflections.  Fully configurable: can be turned
-       off, or dialled from subtle to aggressive.
+The solid interior and background are untouched.  The result is a
+plausible partially-under-segmented mask.
 
 Performance
 -----------
 All operations are vectorised NumPy / OpenCV on uint8 arrays.
-Batch mode uses ``concurrent.futures.ThreadPoolExecutor`` with 12
-workers (tuned for an 8P/16L Intel i-series CPU, reserving 4 threads
-for OS / GPU).
+Batch mode uses ``concurrent.futures.ThreadPoolExecutor``.
 
 Dependencies
 ------------
@@ -32,22 +42,22 @@ Dependencies
 
 Usage
 -----
-    # ── As a library (from render_engine or any script) ──────────
+    # ── As a library ─────────────────────────────────────────────
     from noise_injector import inject_noise, inject_noise_batch
 
-    noisy = inject_noise(clean_mask)                 # default params
-    noisy = inject_noise(clean_mask,                 # custom
-                         edge_width=5,
-                         blur_sigma=1.0,
-                         flip_probability=0.03,
-                         flip_enabled=True,
+    noisy = inject_noise(clean_mask)                    # defaults
+    noisy = inject_noise(clean_mask,                    # custom
+                         n_dents=4,
+                         dent_span_min=80,
+                         dent_span_max=250,
+                         max_depth=3.0,
                          seed=42)
 
-    inject_noise_batch(input_dir, output_dir)        # all PNGs in folder
+    inject_noise_batch(input_dir, output_dir)
 
     # ── Standalone CLI ───────────────────────────────────────────
-    python noise_injector.py -i output/2396N63_Carbide -o output/2396N63_Carbide_noisy
-    python noise_injector.py -i output/2396N63_Carbide --edge-width 7 --flip-off
+    python noise_injector.py -i output/2396N63_Carbide
+    python noise_injector.py -i output/2396N63_Carbide --n-dents 5 --max-depth 3
 """
 
 from __future__ import annotations
@@ -69,21 +79,12 @@ from PIL import Image
 #  CONFIGURATION — Default Noise Parameters
 # ═════════════════════════════════════════════════════════════════════
 
-# --- Edge detection / boundary band ----------------------------------
-EDGE_WIDTH: int      = 5         # Morphological dilation radius (pixels)
-                                 # that defines the "boundary zone".
-                                 # Larger → wider noisy border.
-
-# --- Stage 1: Blur + re-threshold (aliasing) -------------------------
-BLUR_SIGMA: float    = 1.0      # Gaussian sigma for edge blur.
-                                 # 0.5–1.0 = subtle jaggedness,
-                                 # 1.5–2.5 = visible softening.
-
-# --- Stage 2: Specular-flip noise ------------------------------------
-FLIP_ENABLED: bool   = True     # Master switch for flip noise.
-FLIP_PROB: float     = 0.03     # Probability of flipping each boundary
-                                 # pixel.  0.01 = very subtle,
-                                 # 0.05 = moderate, 0.10 = aggressive.
+N_DENTS: int         = 3        # Number of localised erosion patches.
+DENT_SPAN_MIN: int   = 80       # Minimum contour-pixel span per dent.
+DENT_SPAN_MAX: int   = 250      # Maximum contour-pixel span per dent.
+MAX_DEPTH: float     = 2.5      # Maximum inward erosion depth (pixels).
+                                 # Each dent picks a random depth in
+                                 # [1.0, max_depth].
 
 # --- Output format (matches render_engine convention) ----------------
 OUTPUT_IMAGE_FORMAT: str = "PNG"
@@ -99,27 +100,28 @@ NUM_IO_THREADS: int  = 12
 def inject_noise(
     mask: np.ndarray,
     *,
-    edge_width: int          = EDGE_WIDTH,
-    blur_sigma: float        = BLUR_SIGMA,
-    flip_probability: float  = FLIP_PROB,
-    flip_enabled: bool       = FLIP_ENABLED,
+    n_dents: int             = N_DENTS,
+    dent_span_min: int       = DENT_SPAN_MIN,
+    dent_span_max: int       = DENT_SPAN_MAX,
+    max_depth: float         = MAX_DEPTH,
     seed: Optional[int]      = None,
 ) -> np.ndarray:
     """
-    Inject realistic camera / segmentation noise into a clean binary mask.
+    Inject localised contour-erosion dents into a clean binary mask,
+    simulating real background-subtraction under-segmentation.
 
     Parameters
     ----------
     mask : np.ndarray
         Input binary image (uint8, values 0 and 255 only).
-    edge_width : int
-        Half-width (in pixels) of the boundary band where noise is applied.
-    blur_sigma : float
-        Gaussian sigma for edge-aliasing blur.  Set to 0 to skip.
-    flip_probability : float
-        Per-pixel probability of white↔black flip in the boundary zone.
-    flip_enabled : bool
-        Master on/off switch for specular-flip noise.
+    n_dents : int
+        Number of independent erosion patches along the contour.
+    dent_span_min / dent_span_max : int
+        Range (in contour pixels) for each dent's arc length.
+    max_depth : float
+        Maximum inward erosion in pixels.  Each dent picks a random
+        depth in [1.0, max_depth].  Values < 1 effectively disable
+        denting.
     seed : int or None
         RNG seed for reproducibility.  None → non-deterministic.
 
@@ -131,46 +133,62 @@ def inject_noise(
     assert mask.ndim == 2, "Expected a 2-D (H, W) array"
     assert mask.dtype == np.uint8, "Expected uint8 dtype"
 
+    if n_dents <= 0 or max_depth < 0.5:
+        return mask.copy()
+
     rng = np.random.default_rng(seed)
-    out = mask.copy()  # never mutate the caller's array
+    out = mask.copy()
 
-    # ── 1. Build boundary band mask ──────────────────────────────────
-    #    Morphological gradient (dilation − erosion) gives a 1-px-wide
-    #    edge; we dilate that to the desired width.
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (3, 3),
-    )
-    edge_1px = cv2.morphologyEx(out, cv2.MORPH_GRADIENT, kernel)
+    # ── 1. Find the main contour ─────────────────────────────────────
+    contours, _ = cv2.findContours(
+        out, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return out
+    contour = max(contours, key=cv2.contourArea)
+    # contour shape: (N, 1, 2)  →  squeeze to (N, 2)
+    pts = contour.squeeze(axis=1)          # [[x0,y0], [x1,y1], …]
+    n_pts = len(pts)
+    if n_pts < 20:                         # too small to dent
+        return out
 
-    # Widen the boundary to `edge_width` pixels on each side.
-    widen_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE,
-        (2 * edge_width + 1, 2 * edge_width + 1),
-    )
-    band = cv2.dilate(edge_1px, widen_kernel, iterations=1)
-    band_bool = band > 0  # boolean index into the boundary zone
+    # ── 2. Distance transform (how far each FG pixel is from edge) ───
+    dist = cv2.distanceTransform(out, cv2.DIST_L2, 5)
 
-    # ── 2. Edge aliasing — blur + re-threshold ───────────────────────
-    if blur_sigma > 0:
-        # Kernel size must be odd and large enough for the sigma.
-        ksize = int(np.ceil(blur_sigma * 6)) | 1  # ensure odd
-        blurred = cv2.GaussianBlur(
-            out, (ksize, ksize), sigmaX=blur_sigma, sigmaY=blur_sigma,
-        )
-        # Replace only the boundary zone pixels with blurred values,
-        # then re-threshold to stay binary.
-        out[band_bool] = blurred[band_bool]
-        out = np.where(out > 127, 255, 0).astype(np.uint8)
+    # ── 3. Build a dent-depth map ────────────────────────────────────
+    #    For each dent: pick a random start on the contour, a random
+    #    span, and a random depth.  Paint a cosine-windowed depth
+    #    profile along those contour points.
+    dent_map = np.zeros(mask.shape, dtype=np.float32)
 
-    # ── 3. Specular-flip noise ───────────────────────────────────────
-    if flip_enabled and flip_probability > 0:
-        # Generate random flips only for pixels inside the band.
-        n_band = int(np.count_nonzero(band_bool))
-        flips = rng.random(n_band) < flip_probability
-        # XOR flip: 255 ^ 255 = 0, 0 ^ 255 = 255.
-        vals = out[band_bool]
-        vals[flips] ^= 255
-        out[band_bool] = vals
+    for _ in range(n_dents):
+        span = rng.integers(dent_span_min, dent_span_max + 1)
+        span = min(span, n_pts)            # clamp to contour length
+        start = rng.integers(0, n_pts)
+        depth = rng.uniform(1.0, max(1.0, max_depth))
+
+        # Cosine window: 0 at edges, *depth* at centre
+        t = np.linspace(0, np.pi, span)
+        weights = (1.0 - np.cos(t)) / 2.0 * depth   # 0 → depth → 0
+
+        # Paint dent depth along contour points.  We paint a small
+        # filled circle at each contour point so the dent zone has
+        # width (otherwise single-pixel lines leave gaps).
+        radius = max(1, int(np.ceil(depth)))
+        for k in range(span):
+            idx = (start + k) % n_pts
+            cx, cy = int(pts[idx, 0]), int(pts[idx, 1])
+            # Use cv2.circle to paint smoothly (filled)
+            cv2.circle(dent_map, (cx, cy), radius,
+                       float(weights[k]), thickness=-1)
+
+    # Smooth the dent map so transitions are gradual, not pixelated
+    if dent_map.max() > 0:
+        ksize = max(3, (int(np.ceil(max_depth)) * 2) | 1)
+        dent_map = cv2.GaussianBlur(dent_map, (ksize, ksize), sigmaX=1.0)
+
+    # ── 4. Erode: remove FG pixels where dist < dent_depth ───────────
+    erode_mask = (dist > 0) & (dist < dent_map)
+    out[erode_mask] = 0
 
     return out
 
@@ -182,22 +200,21 @@ def inject_noise(
 def _process_one(
     src: Path,
     dst: Path,
-    edge_width: int,
-    blur_sigma: float,
-    flip_probability: float,
-    flip_enabled: bool,
+    n_dents: int,
+    dent_span_min: int,
+    dent_span_max: int,
+    max_depth: float,
     seed: Optional[int],
 ) -> str:
     """Load → inject noise → save.  Returns the destination path string."""
     img = np.array(Image.open(src).convert("L"), dtype=np.uint8)
-    # Ensure strictly binary input (handle any prior anti-aliasing).
     img = np.where(img > 127, 255, 0).astype(np.uint8)
     noisy = inject_noise(
         img,
-        edge_width=edge_width,
-        blur_sigma=blur_sigma,
-        flip_probability=flip_probability,
-        flip_enabled=flip_enabled,
+        n_dents=n_dents,
+        dent_span_min=dent_span_min,
+        dent_span_max=dent_span_max,
+        max_depth=max_depth,
         seed=seed,
     )
     Image.fromarray(noisy, mode="L").save(str(dst), format=OUTPUT_IMAGE_FORMAT)
@@ -208,10 +225,10 @@ def inject_noise_batch(
     input_dir: str,
     output_dir: str,
     *,
-    edge_width: int          = EDGE_WIDTH,
-    blur_sigma: float        = BLUR_SIGMA,
-    flip_probability: float  = FLIP_PROB,
-    flip_enabled: bool       = FLIP_ENABLED,
+    n_dents: int             = N_DENTS,
+    dent_span_min: int       = DENT_SPAN_MIN,
+    dent_span_max: int       = DENT_SPAN_MAX,
+    max_depth: float         = MAX_DEPTH,
     seed: Optional[int]      = None,
     num_threads: int         = NUM_IO_THREADS,
 ) -> None:
@@ -233,9 +250,9 @@ def inject_noise_batch(
         print(f"[NOISE] No image files found in {inp}")
         return
 
-    print(f"[NOISE] {len(files)} masks  |  edge_w={edge_width}  "
-          f"blur_σ={blur_sigma}  flip={'ON' if flip_enabled else 'OFF'}"
-          f"{'  p=' + str(flip_probability) if flip_enabled else ''}")
+    print(f"[NOISE] {len(files)} masks  |  dents={n_dents}  "
+          f"span={dent_span_min}–{dent_span_max}  "
+          f"max_depth={max_depth:.1f} px")
     print(f"[NOISE] {inp}  →  {out}")
 
     t0 = time.perf_counter()
@@ -245,8 +262,8 @@ def inject_noise_batch(
             dst = out / f.name
             fut = pool.submit(
                 _process_one, f, dst,
-                edge_width, blur_sigma, flip_probability,
-                flip_enabled, seed,
+                n_dents, dent_span_min, dent_span_max,
+                max_depth, seed,
             )
             futures[fut] = f.name
 
@@ -272,13 +289,13 @@ def main() -> None:
     _SCRIPT_DIR = Path(__file__).resolve().parent
 
     parser = argparse.ArgumentParser(
-        description="Inject realistic edge noise into clean binary masks",
+        description="Inject localised contour-dent noise into clean binary masks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             '  python noise_injector.py -i output/2396N63_Carbide\n'
-            '  python noise_injector.py -i output/2396N63_Carbide -o output/noisy --flip-off\n'
-            '  python noise_injector.py -i output/2396N63_Carbide --blur-sigma 2.0 --flip-prob 0.08\n'
+            '  python noise_injector.py -i output/2396N63_Carbide -o output/noisy\n'
+            '  python noise_injector.py -i output/2396N63_Carbide --n-dents 5 --max-depth 3\n'
         ),
     )
     parser.add_argument(
@@ -290,20 +307,20 @@ def main() -> None:
         help="Output directory (default: <input>_noisy)",
     )
     parser.add_argument(
-        "--edge-width", type=int, default=EDGE_WIDTH,
-        help=f"Boundary band half-width in pixels (default {EDGE_WIDTH})",
+        "--n-dents", type=int, default=N_DENTS,
+        help=f"Number of localised erosion patches (default {N_DENTS})",
     )
     parser.add_argument(
-        "--blur-sigma", type=float, default=BLUR_SIGMA,
-        help=f"Gaussian sigma for edge aliasing (default {BLUR_SIGMA}; 0 = off)",
+        "--span-min", type=int, default=DENT_SPAN_MIN,
+        help=f"Minimum dent arc length in contour pixels (default {DENT_SPAN_MIN})",
     )
     parser.add_argument(
-        "--flip-prob", type=float, default=FLIP_PROB,
-        help=f"Per-pixel flip probability in boundary (default {FLIP_PROB})",
+        "--span-max", type=int, default=DENT_SPAN_MAX,
+        help=f"Maximum dent arc length in contour pixels (default {DENT_SPAN_MAX})",
     )
     parser.add_argument(
-        "--flip-off", action="store_true", default=False,
-        help="Disable specular-flip noise entirely",
+        "--max-depth", type=float, default=MAX_DEPTH,
+        help=f"Maximum erosion depth in pixels (default {MAX_DEPTH})",
     )
     parser.add_argument(
         "--seed", type=int, default=None,
@@ -328,24 +345,23 @@ def main() -> None:
             out = _SCRIPT_DIR / out
 
     print("=" * 62)
-    print("  noise_injector.py — Edge-Noise Injector")
+    print("  noise_injector.py — Contour-Dent Noise Injector")
     print("=" * 62)
     print(f"  Input    : {inp}")
     print(f"  Output   : {out}")
-    print(f"  Edge W   : {args.edge_width} px")
-    print(f"  Blur σ   : {args.blur_sigma}")
-    print(f"  Flip     : {'OFF' if args.flip_off else 'ON'}"
-          f"{'  p=' + str(args.flip_prob) if not args.flip_off else ''}")
+    print(f"  Dents    : {args.n_dents}")
+    print(f"  Span     : {args.span_min}–{args.span_max} contour px")
+    print(f"  Depth    : {args.max_depth:.1f} px")
     print(f"  Seed     : {args.seed}")
     print(f"  Threads  : {args.threads}")
     print("=" * 62)
 
     inject_noise_batch(
         str(inp), str(out),
-        edge_width=args.edge_width,
-        blur_sigma=args.blur_sigma,
-        flip_probability=args.flip_prob,
-        flip_enabled=not args.flip_off,
+        n_dents=args.n_dents,
+        dent_span_min=args.span_min,
+        dent_span_max=args.span_max,
+        max_depth=args.max_depth,
         seed=args.seed,
         num_threads=args.threads,
     )
