@@ -1,0 +1,11 @@
+# Ignore CAD source files in this simulation repo
+/drills/*.STEP
+/drills/*.STP
+/drills/*.STL
+/drills/*.step
+/drills/*.stp
+/drills/*.stl
+
+# Ignore generated render outputs (mask frames)
+/output/
+/output_masks*/
