@@ -68,10 +68,9 @@ HFOV_DEG: float = 2.0 * np.degrees(np.arctan(SENSOR_W_MM / (2.0 * FOCAL_LENGTH_M
 IMG_W: int = 1280
 IMG_H: int = 960
 
-# --- Framing constraints --------------------------------------------
-TIP_FROM_TOP: float  = 0.60   # Drill tip positioned at 60 % from the top
-TOP_MARGIN: float    = 0.05   # 5 % blank margin above the drill shank
-SIDE_USAGE: float    = 0.80   # Use 80 % of horizontal frame for drill
+# --- Real-world setup ------------------------------------------------
+WORKING_DISTANCE_MM: float = 250.0   # Lens-to-object distance (mm)
+TIP_FROM_TOP: float        = 0.60    # Drill tip positioned at 60 % from the top
 
 # --- Multi-threading (image saving is I/O-bound) --------------------
 #     Intel i-series: 8 physical / 16 logical cores.
@@ -189,6 +188,14 @@ def preprocess_mesh(
 
     # Refresh bounds after centring
     xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
+
+    # In this dataset the CAD tip sits at max-Z.  Flip the mesh so that
+    # the tip ends up at min-Z, which is what the camera framing expects.
+    mesh.points[:, 2] *= -1
+    print("[TIP]  Flipped mesh Z so drill tip is at min-Z")
+
+    # Refresh bounds after flip
+    xmin, xmax, ymin, ymax, zmin, zmax = mesh.bounds
     tip_z: float = zmin
     top_z: float = zmax
 
@@ -213,49 +220,37 @@ def compute_camera(
     max_xy_radius: float,
 ) -> Dict[str, Any]:
     """
-    Determine camera position, focal point, and view angle so that:
+    Place the camera at the real-world working distance (250 mm) with
+    the 75 mm / 1/2" sensor FOV.  Only the tip region is in frame —
+    exactly like the physical VS-LDV75 setup at F4.
 
-    • The vertical FOV matches a 75 mm lens on a 1/2" sensor.
-    • The drill tip (min Z) appears at exactly 60 % from the top of the frame.
-    • The full drill body fits inside the frame with configurable margins.
+    Visible area at 250 mm
+    ----------------------
+    H_visible ≈ 16.0 mm   (vertical)
+    W_visible ≈ 21.3 mm   (horizontal)
 
     Camera convention
     -----------------
-    The camera is placed along the **−Y** direction looking toward **+Y**.
-    World Z ↑ maps to image vertical (up), world X → image horizontal.
+    Camera on **−Y** looking toward **+Y**.
+    World Z ↑ → image vertical, world X → image horizontal.
 
     Frame coordinate *f* (fraction from bottom, 0 = bottom, 1 = top):
-        z(f) = z_cam − H/2 + f · H   where H = visible height at object plane.
+        z(f) = z_cam − H/2 + f · H
     """
     half_vfov = np.radians(VFOV_DEG / 2.0)
-    half_hfov = np.radians(HFOV_DEG / 2.0)
-    z_height = top_z - tip_z
 
-    # Frame fractions (measured from bottom)
-    f_tip = 1.0 - TIP_FROM_TOP      # 0.40 — tip at 40 % from bottom
-    f_top = 1.0 - TOP_MARGIN        # 0.95 — top of drill at 95 % from bottom
-    drill_frac = f_top - f_tip       # 0.55 — drill uses 55 % of vertical frame
+    # Fixed working distance — matches the real inspection rig
+    d = WORKING_DISTANCE_MM          # 250 mm
 
-    # Required total visible height
-    H_required = z_height / drill_frac
-
-    # Camera distance to achieve that visible height with the given VFOV
-    d_vertical = H_required / (2.0 * np.tan(half_vfov))
-
-    # Camera distance to fit the rotational XY envelope horizontally
-    d_horizontal = max_xy_radius / (SIDE_USAGE * np.tan(half_hfov))
-
-    # Use the more restrictive (larger) distance
-    d = max(d_vertical, d_horizontal)
-
-    # Actual visible height at the chosen distance
+    # Visible height at that distance
     H_visible = 2.0 * d * np.tan(half_vfov)
 
-    # Camera Z so that z_tip appears at fraction f_tip from bottom
-    #   z_tip = z_cam − H/2 + f_tip · H   →   z_cam = z_tip + H/2 − f_tip · H
+    # Position tip at TIP_FROM_TOP fraction from the top of the frame
+    # f_tip = fraction from BOTTOM
+    f_tip = 1.0 - TIP_FROM_TOP       # e.g. 0.40 from bottom
     z_cam = tip_z + H_visible * (0.5 - f_tip)
 
-    # Generous clipping planes
+    # Clipping planes
     clip_near = d * 0.01
     clip_far  = d * 10.0
 
@@ -263,17 +258,17 @@ def compute_camera(
         position      = (0.0, -d, z_cam),
         focal_point   = (0.0, 0.0, z_cam),
         view_up       = (0.0, 0.0, 1.0),
-        view_angle    = VFOV_DEG,          # VTK interprets this as vertical FOV
+        view_angle    = VFOV_DEG,
         clipping_range= (clip_near, clip_far),
         distance      = d,
         H_visible     = H_visible,
     )
 
-    print(f"[CAM]  VFOV     = {VFOV_DEG:.3f}°")
-    print(f"[CAM]  HFOV     = {HFOV_DEG:.3f}°")
-    print(f"[CAM]  Distance = {d:.2f}")
-    print(f"[CAM]  Z centre = {z_cam:.4f}")
-    print(f"[CAM]  Visible H= {H_visible:.4f}")
+    print(f"[CAM]  VFOV      = {VFOV_DEG:.3f}°")
+    print(f"[CAM]  HFOV      = {HFOV_DEG:.3f}°")
+    print(f"[CAM]  Work Dist = {d:.1f} mm")
+    print(f"[CAM]  Z centre  = {z_cam:.4f}")
+    print(f"[CAM]  Visible H = {H_visible:.4f} mm  (≈ tip region only)")
     return cam
 
 
@@ -492,9 +487,13 @@ def main() -> None:
         "-m", "--model", required=True,
         help="Path to 3D model file (.step, .stp, or .stl)",
     )
+    # Anchor default output to the script's own directory so the result
+    # is the same regardless of where the user runs the command from.
+    _SCRIPT_DIR = str(Path(__file__).resolve().parent)
+    _DEFAULT_OUTPUT = str(Path(_SCRIPT_DIR) / "output")
     parser.add_argument(
-        "-o", "--output", default="Simulation/output",
-        help="Root output directory (default: Simulation/output/)"
+        "-o", "--output", default=_DEFAULT_OUTPUT,
+        help="Root output directory (default: <script_dir>/output/)"
              " — frames are saved to <output>/<tool_name>/",
     )
     parser.add_argument(
