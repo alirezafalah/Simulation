@@ -8,4 +8,4 @@
 
 # Ignore generated render outputs (mask frames)
 /output/
-/output_masks*/
+/output_noisy/

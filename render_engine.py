@@ -70,7 +70,7 @@ IMG_H: int = 960
 
 # --- Real-world setup ------------------------------------------------
 WORKING_DISTANCE_MM: float = 250.0   # Lens-to-object distance (mm)
-TIP_FROM_TOP: float        = 0.60    # Drill tip positioned at 60 % from the top
+TIP_FROM_TOP: float        = 0.80    # Drill tip positioned at 60 % from the top
 
 # --- Multi-threading (image saving is I/O-bound) --------------------
 #     Intel i-series: 8 physical / 16 logical cores.
