@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QProgressBar,
     QListWidget, QAbstractItemView, QGroupBox, QTextEdit,
     QSplitter, QMessageBox, QSizePolicy, QDialog, QScrollArea,
+    QSlider,
 )
 
 # ── Local modules (same folder) ─────────────────────────────────────
@@ -513,6 +514,9 @@ class SimulationGUI(QMainWindow):
 
         # Cached sample mask for live noise preview
         self._sample_mask: Optional[np.ndarray] = None
+        # Cached planned dent events for temporal preview
+        self._preview_events: list = []
+        self._preview_n_frames: int = 360
 
         self._build_ui()
 
@@ -818,6 +822,44 @@ class SimulationGUI(QMainWindow):
         load_row.addWidget(self.noise_mask_path_label, stretch=1)
         prev_lay.addLayout(load_row)
 
+        # Frame scrubber for temporal preview
+        frame_row = QHBoxLayout()
+        frame_row.addWidget(QLabel("Preview frame:"))
+
+        self.noise_frame_slider = QSlider(Qt.Horizontal)
+        self.noise_frame_slider.setRange(0, 359)
+        self.noise_frame_slider.setValue(0)
+        self.noise_frame_slider.setToolTip(
+            "Scrub through frames to see the temporal dent\n"
+            "fade in / peak / fade out on the loaded mask.")
+        frame_row.addWidget(self.noise_frame_slider, stretch=1)
+
+        self.noise_frame_spin = QSpinBox()
+        self.noise_frame_spin.setRange(0, 359)
+        self.noise_frame_spin.setValue(0)
+        self.noise_frame_spin.setSuffix(" / 359")
+        self.noise_frame_spin.setFixedWidth(110)
+        frame_row.addWidget(self.noise_frame_spin)
+
+        self.btn_jump_peak = QPushButton("Jump to Peak")
+        self.btn_jump_peak.setToolTip(
+            "Jump to the frame where the first dent event\n"
+            "reaches maximum depth.")
+        self.btn_jump_peak.setFixedWidth(110)
+        frame_row.addWidget(self.btn_jump_peak)
+
+        prev_lay.addLayout(frame_row)
+
+        # Keep slider ↔ spinbox in sync
+        self.noise_frame_slider.valueChanged.connect(
+            self.noise_frame_spin.setValue)
+        self.noise_frame_spin.valueChanged.connect(
+            self.noise_frame_slider.setValue)
+        # Scrubbing updates the noisy preview
+        self.noise_frame_spin.valueChanged.connect(
+            self._update_noise_preview)
+        self.btn_jump_peak.clicked.connect(self._jump_to_peak_frame)
+
         # Side-by-side: Original | Noisy
         side = QHBoxLayout()
 
@@ -852,14 +894,14 @@ class SimulationGUI(QMainWindow):
         prev_lay.addLayout(side, stretch=1)
         lay.addWidget(prev_group, stretch=1)
 
-        # Connect every noise param widget to live preview update
-        self.spin_n_events.valueChanged.connect(self._update_noise_preview)
-        self.spin_frame_span_min.valueChanged.connect(self._update_noise_preview)
-        self.spin_frame_span_max.valueChanged.connect(self._update_noise_preview)
-        self.spin_span_min.valueChanged.connect(self._update_noise_preview)
-        self.spin_span_max.valueChanged.connect(self._update_noise_preview)
-        self.spin_max_depth.valueChanged.connect(self._update_noise_preview)
-        self.spin_seed.valueChanged.connect(self._update_noise_preview)
+        # Connect noise param widgets → replan events (which auto-updates preview)
+        self.spin_n_events.valueChanged.connect(self._replan_noise_events)
+        self.spin_frame_span_min.valueChanged.connect(self._replan_noise_events)
+        self.spin_frame_span_max.valueChanged.connect(self._replan_noise_events)
+        self.spin_span_min.valueChanged.connect(self._replan_noise_events)
+        self.spin_span_max.valueChanged.connect(self._replan_noise_events)
+        self.spin_max_depth.valueChanged.connect(self._replan_noise_events)
+        self.spin_seed.valueChanged.connect(self._replan_noise_events)
 
         # ── Standalone batch section ─────────────────────────────────
         batch_group = QGroupBox("Standalone Batch — Apply Noise to Folder")
@@ -1039,27 +1081,68 @@ class SimulationGUI(QMainWindow):
         pm_orig = _gray_to_pixmap(img)
         self.noise_orig_preview.set_preview(pm_orig, f"Original — {name}")
 
-        # Apply current noise and show result
-        self._update_noise_preview()
+        # Plan events and jump to the peak frame
+        self._replan_noise_events()
 
     @Slot()
-    def _update_noise_preview(self) -> None:
-        """Re-apply noise with current GUI params to the cached sample mask."""
-        if self._sample_mask is None:
-            return
-
+    def _replan_noise_events(self) -> None:
+        """Re-plan temporal dent events from current GUI params,
+        auto-jump the frame slider to the peak frame, and refresh preview."""
         nc = self._collect_noise_cfg()
-        noisy = NI.inject_noise(
-            self._sample_mask,
-            n_dents=int(nc["n_events"]),
+        n_frames = self._preview_n_frames
+
+        # Update slider/spinbox range to match n_frames
+        self.noise_frame_slider.setRange(0, max(0, n_frames - 1))
+        self.noise_frame_spin.setRange(0, max(0, n_frames - 1))
+        self.noise_frame_spin.setSuffix(f" / {n_frames - 1}")
+
+        self._preview_events = NI.plan_dent_events(
+            n_events=int(nc["n_events"]),
+            n_frames=n_frames,
+            frame_span_min=int(nc["frame_span_min"]),
+            frame_span_max=int(nc["frame_span_max"]),
             dent_span_min=int(nc["dent_span_min"]),
             dent_span_max=int(nc["dent_span_max"]),
             max_depth=float(nc["max_depth"]),
             seed=nc.get("seed"),
         )
 
+        # Auto-jump to peak frame of first event
+        if self._preview_events:
+            peak = self._preview_events[0].peak_frame % n_frames
+            self.noise_frame_spin.setValue(peak)   # triggers _update_noise_preview
+        else:
+            self._update_noise_preview()
+
+    @Slot()
+    def _jump_to_peak_frame(self) -> None:
+        """Jump the frame slider to the peak frame of the first event."""
+        if self._preview_events:
+            peak = self._preview_events[0].peak_frame % self._preview_n_frames
+            self.noise_frame_spin.setValue(peak)
+
+    @Slot()
+    def _update_noise_preview(self) -> None:
+        """Apply temporal noise at the current preview frame and refresh."""
+        if self._sample_mask is None:
+            return
+
+        frame_idx = self.noise_frame_spin.value()
+        n_frames = self._preview_n_frames
+
+        if self._preview_events:
+            noisy = NI.inject_noise_frame(
+                self._sample_mask,
+                self._preview_events,
+                frame_idx,
+                n_frames=n_frames,
+            )
+        else:
+            noisy = self._sample_mask.copy()
+
         pm = _gray_to_pixmap(noisy)
-        self.noise_result_preview.set_preview(pm, "Noisy result")
+        self.noise_result_preview.set_preview(
+            pm, f"Noisy — frame {frame_idx}")
 
     # ─────────────────────────────────────────────────────────────────
     #  STANDALONE NOISE BATCH

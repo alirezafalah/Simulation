@@ -44,12 +44,12 @@ from PIL import Image
 #  CONFIGURATION — defaults
 # ═════════════════════════════════════════════════════════════════════
 
-N_EVENTS: int        = 2        # dent events per tool (1–2 typical)
-FRAME_SPAN_MIN: int  = 5        # minimum consecutive frames per event
-FRAME_SPAN_MAX: int  = 15       # maximum consecutive frames per event
-DENT_SPAN_MIN: int   = 80       # min contour-pixel arc per dent
-DENT_SPAN_MAX: int   = 250      # max contour-pixel arc per dent
-MAX_DEPTH: float     = 2.5      # peak erosion depth (px)
+N_EVENTS: int        = 1        # dent events per tool (1–2 typical)
+FRAME_SPAN_MIN: int  = 10        # minimum consecutive frames per event
+FRAME_SPAN_MAX: int  = 20       # maximum consecutive frames per event
+DENT_SPAN_MIN: int   = 250       # min contour-pixel arc per dent
+DENT_SPAN_MAX: int   = 500      # max contour-pixel arc per dent
+MAX_DEPTH: float     = 3.5      # peak erosion depth (px)
 N_FRAMES: int        = 360      # total frames in one rotation
 
 OUTPUT_IMAGE_FORMAT: str = "PNG"
