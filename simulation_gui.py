@@ -31,7 +31,7 @@ import sys
 import traceback
 import numpy as np
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 # ── Qt ───────────────────────────────────────────────────────────────
 from PySide6.QtCore import (
@@ -51,6 +51,7 @@ from PySide6.QtWidgets import (
 # ── Local modules (same folder) ─────────────────────────────────────
 import render_engine as RE
 import noise_injector as NI
+import augmentor as AUG
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -221,7 +222,7 @@ class DatasetWorker(QThread):
         clean_output_dir: str,
         noisy_output_dir: str,
         render_cfg: Dict[str, Any],
-        noise_cfg: Dict[str, Any],
+        noise_cfgs: List[Dict[str, Any]],
         apply_noise: bool,
     ):
         super().__init__()
@@ -229,7 +230,7 @@ class DatasetWorker(QThread):
         self.clean_output_dir = clean_output_dir
         self.noisy_output_dir = noisy_output_dir
         self.render_cfg       = render_cfg
-        self.noise_cfg        = noise_cfg
+        self.noise_cfgs       = noise_cfgs      # list of 1+ noise configs
         self.apply_noise      = apply_noise
         self._abort           = False
 
@@ -244,7 +245,6 @@ class DatasetWorker(QThread):
         try:
             n_tools = len(self.model_paths)
             rc = self.render_cfg
-            nc = self.noise_cfg
 
             img_w  = int(rc["img_w"])
             img_h  = int(rc["img_h"])
@@ -254,6 +254,21 @@ class DatasetWorker(QThread):
             img_format   = rc["image_format"].strip().upper()
             ext = "png" if img_format == "PNG" else "tiff"
 
+            # Prepare versioned noisy output folders — one per noise config
+            noisy_runs: List[Tuple[Path, Dict[str, Any]]] = []
+            if self.apply_noise:
+                for nc in self.noise_cfgs:
+                    run_dir = NI._next_noise_run_dir(
+                        Path(self.noisy_output_dir))
+                    run_dir.mkdir(parents=True, exist_ok=True)
+                    label = nc.get("preset_label", "")
+                    self.sig.log.emit(
+                        f"[NOISE] Versioned output → {run_dir.name}"
+                        + (f"  ({label})" if label else ""))
+                    noisy_runs.append((run_dir, nc))
+
+            tool_names: list = []
+
             for ti, model_path in enumerate(self.model_paths):
                 if self._abort:
                     self.sig.log.emit("[ABORT] Cancelled by user.")
@@ -262,6 +277,7 @@ class DatasetWorker(QThread):
                 tool_name = RE.get_tool_name(model_path)
                 self.sig.tool_started.emit(ti, tool_name)
                 self.sig.log.emit(f"── Tool {ti+1}/{n_tools}: {tool_name} ──")
+                tool_names.append(tool_name)
 
                 self.sig.log.emit(f"[LOAD] {Path(model_path).name}")
                 mesh = RE.load_mesh(model_path)
@@ -289,12 +305,13 @@ class DatasetWorker(QThread):
 
                 clean_dir = Path(self.clean_output_dir) / tool_name
                 clean_dir.mkdir(parents=True, exist_ok=True)
-                noisy_dir: Optional[Path] = None
-                dent_events: list = []
-                if self.apply_noise:
-                    noisy_dir = Path(self.noisy_output_dir) / tool_name
-                    noisy_dir.mkdir(parents=True, exist_ok=True)
-                    dent_events = NI.plan_dent_events(
+
+                # Plan dent events for each noise preset
+                run_data: List[Tuple[Path, list]] = []
+                for (run_dir, nc) in noisy_runs:
+                    nd = run_dir / tool_name
+                    nd.mkdir(parents=True, exist_ok=True)
+                    events = NI.plan_dent_events(
                         n_events=int(nc["n_events"]),
                         n_frames=n_frames,
                         frame_span_min=int(nc["frame_span_min"]),
@@ -304,6 +321,7 @@ class DatasetWorker(QThread):
                         max_depth=float(nc["max_depth"]),
                         seed=nc.get("seed"),
                     )
+                    run_data.append((nd, events))
 
                 for angle in range(n_frames):
                     if self._abort:
@@ -321,12 +339,14 @@ class DatasetWorker(QThread):
                     Image.fromarray(mask, mode="L").save(
                         clean_path, format=img_format)
 
-                    if self.apply_noise and noisy_dir is not None:
+                    # Apply each noise preset to same clean mask
+                    for (noisy_dir, dent_events) in run_data:
                         noisy = NI.inject_noise_frame(
                             mask, dent_events, angle,
                             n_frames=n_frames,
                         )
-                        noisy_path = str(noisy_dir / f"mask_{angle:03d}.{ext}")
+                        noisy_path = str(
+                            noisy_dir / f"mask_{angle:03d}.{ext}")
                         Image.fromarray(noisy, mode="L").save(
                             noisy_path, format=img_format)
 
@@ -334,6 +354,13 @@ class DatasetWorker(QThread):
 
                 plotter.close()
                 self.sig.tool_done.emit(ti + 1, n_tools)
+
+            # Write noise_config.json for each run folder
+            for (run_dir, nc) in noisy_runs:
+                NI._write_noise_config(
+                    run_dir, nc, tool_names=tool_names)
+                self.sig.log.emit(
+                    f"[NOISE] Config saved: {run_dir / 'noise_config.json'}")
 
             self.sig.log.emit("[DONE] Dataset generation complete.")
         except Exception:
@@ -395,19 +422,60 @@ class PreviewWorker(QThread):
             self.sig.finished.emit()
 
 
-class NoiseBatchWorker(QThread):
-    """Standalone thread: apply noise to every mask in a folder."""
+class AugmentWorker(QThread):
+    """Thread: augment all STEP files in a folder with versioned output."""
     sig = _WorkerSignals()
 
     def __init__(
         self,
         input_dir: str,
-        output_dir: str,
+        output_root: str,
+        aug_cfg: Dict[str, Any],
+    ):
+        super().__init__()
+        self.input_dir   = input_dir
+        self.output_root = output_root
+        self.aug_cfg     = aug_cfg
+        self._abort      = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        try:
+            ac = self.aug_cfg
+            run_dir = AUG.augment_batch(
+                self.input_dir,
+                self.output_root,
+                scale_x=float(ac["scale_x"]),
+                scale_y=float(ac["scale_y"]),
+                scale_z=float(ac["scale_z"]),
+                progress_callback=lambda done, total: self.sig.frame_done.emit(done, total),
+                log_callback=lambda msg: self.sig.log.emit(msg),
+                abort_flag=self,
+            )
+            if run_dir is not None:
+                self.sig.log.emit(
+                    f"[DONE] Augmentation complete → {run_dir.name}")
+        except Exception:
+            self.sig.error.emit(traceback.format_exc())
+        finally:
+            self.sig.finished.emit()
+
+
+class NoiseBatchWorker(QThread):
+    """Standalone thread: apply noise to ALL tool subfolders, versioned output."""
+    sig = _WorkerSignals()
+
+    def __init__(
+        self,
+        clean_root: str,
+        noisy_root: str,
         noise_cfg: Dict[str, Any],
     ):
         super().__init__()
-        self.input_dir  = input_dir
-        self.output_dir = output_dir
+        self.clean_root = clean_root
+        self.noisy_root = noisy_root
         self.noise_cfg  = noise_cfg
         self._abort     = False
 
@@ -415,54 +483,32 @@ class NoiseBatchWorker(QThread):
         self._abort = True
 
     def run(self) -> None:
-        from PIL import Image
-
         try:
-            nc  = self.noise_cfg
-            inp = Path(self.input_dir)
-            out = Path(self.output_dir)
-            out.mkdir(parents=True, exist_ok=True)
+            nc = self.noise_cfg
 
-            files = sorted(
-                f for f in inp.iterdir()
-                if f.suffix.lower() in (".png", ".tiff", ".tif")
-            )
-            if not files:
-                self.sig.log.emit(f"[NOISE] No image files in {inp}")
-                return
+            def _progress(ti, n_tools, fi, n_frames):
+                # Emit combined progress: tool*frames linearised
+                total = n_tools * n_frames
+                done  = ti * n_frames + fi
+                self.sig.frame_done.emit(done, total)
 
-            total = len(files)
-            self.sig.log.emit(
-                f"[NOISE] Processing {total} masks: {inp} → {out}")
-
-            # Plan temporal dent events once for this folder
-            dent_events = NI.plan_dent_events(
+            run_dir = NI.inject_noise_batch_all(
+                self.clean_root,
+                self.noisy_root,
                 n_events=int(nc["n_events"]),
-                n_frames=total,
                 frame_span_min=int(nc["frame_span_min"]),
                 frame_span_max=int(nc["frame_span_max"]),
                 dent_span_min=int(nc["dent_span_min"]),
                 dent_span_max=int(nc["dent_span_max"]),
                 max_depth=float(nc["max_depth"]),
                 seed=nc.get("seed"),
+                progress_callback=_progress,
+                log_callback=lambda msg: self.sig.log.emit(msg),
+                abort_flag=self,
             )
-
-            for i, src in enumerate(files):
-                if self._abort:
-                    self.sig.log.emit("[ABORT] Noise batch cancelled.")
-                    break
-
-                img = np.array(
-                    Image.open(src).convert("L"), dtype=np.uint8)
-                img = np.where(img > 127, 255, 0).astype(np.uint8)
-
-                noisy = NI.inject_noise_frame(
-                    img, dent_events, i, n_frames=total)
-                dst = out / src.name
-                Image.fromarray(noisy, mode="L").save(str(dst), format="PNG")
-                self.sig.frame_done.emit(i + 1, total)
-
-            self.sig.log.emit("[DONE] Noise batch complete.")
+            if run_dir is not None:
+                self.sig.log.emit(
+                    f"[DONE] Noise run complete → {run_dir.name}")
         except Exception:
             self.sig.error.emit(traceback.format_exc())
         finally:
@@ -535,6 +581,7 @@ class SimulationGUI(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_render_tab(), "⚙  Render")
         self.tabs.addTab(self._build_noise_tab(),  "🔊  Noise")
+        self.tabs.addTab(self._build_augment_tab(), "🔧  Augment")
         root.addWidget(self.tabs, stretch=1)
 
         # ── Progress bars ────────────────────────────────────────────
@@ -671,7 +718,7 @@ class SimulationGUI(QMainWindow):
         form.addRow("Frames (rotation):", self.spin_frames)
 
         self.combo_fmt = QComboBox()
-        self.combo_fmt.addItems(["PNG", "TIFF"])
+        self.combo_fmt.addItems(["TIFF", "PNG"])
         form.addRow("Image Format:", self.combo_fmt)
 
         lay.addWidget(cam_group)
@@ -716,10 +763,29 @@ class SimulationGUI(QMainWindow):
 
         # --- Enable / disable during dataset generation ---
         self.chk_noise = QCheckBox(
-            "Apply noise during dataset generation (Render tab)")
+            "Apply current noise preset during generation "
+            "(single noise_NNN folder)")
         self.chk_noise.setChecked(True)
+        self.chk_noise.setToolTip(
+            "Applies the noise preset currently selected above\n"
+            "(or your custom values) to each rendered frame,\n"
+            "saving results in one versioned noise_NNN folder.")
         self.chk_noise.setStyleSheet("font-size: 13px; font-weight: bold;")
         lay.addWidget(self.chk_noise)
+
+        # --- Apply all presets checkbox ---
+        self.chk_all_noise_presets = QCheckBox(
+            "Apply ALL noise presets during generation "
+            "(one noise_NNN folder per preset)")
+        self.chk_all_noise_presets.setChecked(False)
+        self.chk_all_noise_presets.setToolTip(
+            "When checked, Generate Dataset renders clean masks once\n"
+            "then applies EVERY noise preset (Default / Moderate /\n"
+            "Aggressive), saving each to its own versioned noise_NNN\n"
+            "subfolder.  Overrides the single-preset checkbox above.")
+        self.chk_all_noise_presets.setStyleSheet(
+            "font-size: 12px; color: #bbb;")
+        lay.addWidget(self.chk_all_noise_presets)
 
         # --- Noisy output dir (used by Generate Dataset) ---
         nout_group = QGroupBox("Noisy Output Directory (dataset generation)")
@@ -731,6 +797,21 @@ class SimulationGUI(QMainWindow):
             lambda: self._browse_dir(self.noisy_out_edit))
         no_lay.addWidget(btn_bn)
         lay.addWidget(nout_group)
+
+        # --- Noise preset selector ---
+        preset_group = QGroupBox("Noise Preset")
+        ps_lay = QFormLayout(preset_group)
+
+        self.combo_noise_preset = QComboBox()
+        self.combo_noise_preset.addItems(NI.NOISE_PRESET_NAMES)
+        self.combo_noise_preset.addItem("Custom")
+        self.combo_noise_preset.setToolTip(
+            "Select a preset to auto-fill all noise parameters,\n"
+            "or choose 'Custom' to set values manually.")
+        self.combo_noise_preset.currentIndexChanged.connect(
+            self._on_noise_preset_changed)
+        ps_lay.addRow("Preset:", self.combo_noise_preset)
+        lay.addWidget(preset_group)
 
         # --- Noise parameters ---
         noise_group = QGroupBox("Dent Event Parameters (temporally-coherent contour erosion)")
@@ -903,6 +984,12 @@ class SimulationGUI(QMainWindow):
         self.spin_max_depth.valueChanged.connect(self._replan_noise_events)
         self.spin_seed.valueChanged.connect(self._replan_noise_events)
 
+        # When user edits a spinbox manually, switch combo to "Custom"
+        for spin in (self.spin_n_events, self.spin_frame_span_min,
+                     self.spin_frame_span_max, self.spin_span_min,
+                     self.spin_span_max, self.spin_max_depth, self.spin_seed):
+            spin.valueChanged.connect(self._noise_param_manual_change)
+
         # ── Standalone batch section ─────────────────────────────────
         batch_group = QGroupBox("Standalone Batch — Apply Noise to Folder")
         bg_lay = QVBoxLayout(batch_group)
@@ -916,8 +1003,10 @@ class SimulationGUI(QMainWindow):
             lambda: self._browse_dir(self.noise_batch_in))
         dir_row.addWidget(btn_bi, 0, 2)
 
-        dir_row.addWidget(QLabel("Output folder:"), 1, 0)
+        dir_row.addWidget(QLabel("Noisy output root:"), 1, 0)
         self.noise_batch_out = QLineEdit(str(_SCRIPT_DIR / "output_noisy"))
+        self.noise_batch_out.setToolTip(
+            "Parent folder where versioned noise_NNN subfolders are created.")
         dir_row.addWidget(self.noise_batch_out, 1, 1)
         btn_bo = QPushButton("Browse …")
         btn_bo.clicked.connect(
@@ -931,7 +1020,7 @@ class SimulationGUI(QMainWindow):
         bg_lay.addWidget(self.prog_noise_batch)
 
         nbtn_row = QHBoxLayout()
-        self.btn_noise_batch = QPushButton("  Process Folder  ")
+        self.btn_noise_batch = QPushButton("  🚀  Run Noise on All Tools  ")
         self.btn_noise_batch.setMinimumHeight(36)
         self.btn_noise_batch.setStyleSheet(
             "QPushButton { background-color: #5a3a8a; color: white; "
@@ -956,6 +1045,141 @@ class SimulationGUI(QMainWindow):
         bg_lay.addLayout(nbtn_row)
 
         lay.addWidget(batch_group)
+
+        tab.setWidget(inner)
+        return tab
+
+    # ── AUGMENTATION TAB ────────────────────────────────────────────
+
+    def _build_augment_tab(self) -> QWidget:
+        tab = QScrollArea()
+        tab.setWidgetResizable(True)
+        tab.setFrameShape(QScrollArea.NoFrame)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setSpacing(8)
+
+        # --- Info banner ---
+        info = QLabel(
+            "<b>CAD Geometry Augmentation</b> — apply non-uniform scaling "
+            "to STEP files to create geometrically diverse training data.\n"
+            "Output is a versioned <code>aug_NNN/</code> subfolder with "
+            "<code>augmentation_config.json</code>."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; padding: 4px;")
+        lay.addWidget(info)
+
+        # --- Preset selector ---
+        preset_group = QGroupBox("Augmentation Preset")
+        pg_lay = QFormLayout(preset_group)
+
+        self.combo_aug_preset = QComboBox()
+        self.combo_aug_preset.addItems(AUG.PRESET_NAMES)
+        self.combo_aug_preset.addItem("Custom")
+        self.combo_aug_preset.setToolTip(
+            "Select a preset to auto-fill Scale X/Y/Z,\n"
+            "or choose 'Custom' to set values manually.")
+        self.combo_aug_preset.currentIndexChanged.connect(
+            self._on_aug_preset_changed)
+        pg_lay.addRow("Preset:", self.combo_aug_preset)
+        lay.addWidget(preset_group)
+
+        # --- Scale parameters ---
+        scale_group = QGroupBox("Scale Factors")
+        sf_lay = QFormLayout(scale_group)
+
+        self.spin_aug_sx = QDoubleSpinBox()
+        self.spin_aug_sx.setRange(0.50, 2.00)
+        self.spin_aug_sx.setSingleStep(0.01)
+        self.spin_aug_sx.setDecimals(3)
+        self.spin_aug_sx.setToolTip("Scale factor for the X axis.")
+        sf_lay.addRow("Scale X:", self.spin_aug_sx)
+
+        self.spin_aug_sy = QDoubleSpinBox()
+        self.spin_aug_sy.setRange(0.50, 2.00)
+        self.spin_aug_sy.setSingleStep(0.01)
+        self.spin_aug_sy.setDecimals(3)
+        self.spin_aug_sy.setToolTip("Scale factor for the Y axis.")
+        sf_lay.addRow("Scale Y:", self.spin_aug_sy)
+
+        self.spin_aug_sz = QDoubleSpinBox()
+        self.spin_aug_sz.setRange(0.50, 2.00)
+        self.spin_aug_sz.setSingleStep(0.01)
+        self.spin_aug_sz.setDecimals(3)
+        self.spin_aug_sz.setToolTip(
+            "Scale factor for the Z axis (drill length axis).")
+        sf_lay.addRow("Scale Z:", self.spin_aug_sz)
+
+        lay.addWidget(scale_group)
+
+        # Fill initial preset values
+        self._on_aug_preset_changed(0)
+
+        # --- Input / output directories ---
+        dir_group = QGroupBox("Directories")
+        dg_lay = QGridLayout(dir_group)
+
+        dg_lay.addWidget(QLabel("STEP input folder:"), 0, 0)
+        self.aug_input_edit = QLineEdit(str(_SCRIPT_DIR / "drills"))
+        self.aug_input_edit.setToolTip(
+            "Folder containing .step / .stp files to augment.")
+        dg_lay.addWidget(self.aug_input_edit, 0, 1)
+        btn_ai = QPushButton("Browse …")
+        btn_ai.clicked.connect(
+            lambda: self._browse_dir(self.aug_input_edit))
+        dg_lay.addWidget(btn_ai, 0, 2)
+
+        dg_lay.addWidget(QLabel("Augmented output root:"), 1, 0)
+        self.aug_output_edit = QLineEdit(
+            str(_SCRIPT_DIR / "drills_augmented"))
+        self.aug_output_edit.setToolTip(
+            "Parent folder where versioned aug_NNN/ subfolders are created.")
+        dg_lay.addWidget(self.aug_output_edit, 1, 1)
+        btn_ao = QPushButton("Browse …")
+        btn_ao.clicked.connect(
+            lambda: self._browse_dir(self.aug_output_edit))
+        dg_lay.addWidget(btn_ao, 1, 2)
+
+        lay.addWidget(dir_group)
+
+        # --- Progress bar ---
+        self.prog_augment = QProgressBar()
+        self.prog_augment.setTextVisible(True)
+        self.prog_augment.setFormat("%v / %m  STEP files")
+        lay.addWidget(self.prog_augment)
+
+        # --- Action buttons ---
+        abtn_row = QHBoxLayout()
+
+        self.btn_augment = QPushButton(
+            "  🔧  Augment All STEP Files  ")
+        self.btn_augment.setMinimumHeight(36)
+        self.btn_augment.setStyleSheet(
+            "QPushButton { background-color: #1a5a7a; color: white; "
+            "font-size: 13px; font-weight: bold; border-radius: 5px; }"
+            "QPushButton:hover { background-color: #2080b0; }"
+            "QPushButton:disabled { background-color: #333; color: #666; }"
+        )
+        self.btn_augment.clicked.connect(self._on_augment)
+        abtn_row.addWidget(self.btn_augment)
+
+        self.btn_augment_abort = QPushButton("Abort")
+        self.btn_augment_abort.setEnabled(False)
+        self.btn_augment_abort.setMinimumHeight(36)
+        self.btn_augment_abort.setStyleSheet(
+            "QPushButton { background-color: #8b1a1a; color: white; "
+            "font-size: 12px; border-radius: 5px; }"
+            "QPushButton:hover { background-color: #b22222; }"
+            "QPushButton:disabled { background-color: #333; color: #666; }"
+        )
+        self.btn_augment_abort.clicked.connect(self._on_augment_abort)
+        abtn_row.addWidget(self.btn_augment_abort)
+
+        lay.addLayout(abtn_row)
+
+        # Stretch at bottom
+        lay.addStretch(1)
 
         tab.setWidget(inner)
         return tab
@@ -1053,6 +1277,39 @@ class SimulationGUI(QMainWindow):
     def _show_render_preview(self, rgb: np.ndarray) -> None:
         pm = _rgb_to_pixmap(rgb)
         self.render_preview.set_preview(pm, "Render Preview (full resolution)")
+
+    # ─────────────────────────────────────────────────────────────────
+    #  NOISE PRESET
+    # ─────────────────────────────────────────────────────────────────
+
+    _noise_preset_updating: bool = False   # guard flag
+
+    @Slot(int)
+    def _on_noise_preset_changed(self, idx: int) -> None:
+        """Fill noise spinboxes from the selected preset."""
+        if idx < len(NI.NOISE_PRESET_NAMES):
+            p = NI.NOISE_PRESETS[NI.NOISE_PRESET_NAMES[idx]]
+            self._noise_preset_updating = True
+            self.spin_n_events.setValue(int(p["n_events"]))
+            self.spin_frame_span_min.setValue(int(p["frame_span_min"]))
+            self.spin_frame_span_max.setValue(int(p["frame_span_max"]))
+            self.spin_span_min.setValue(int(p["dent_span_min"]))
+            self.spin_span_max.setValue(int(p["dent_span_max"]))
+            self.spin_max_depth.setValue(float(p["max_depth"]))
+            seed_v = p.get("seed")
+            self.spin_seed.setValue(-1 if seed_v is None else seed_v)
+            self._noise_preset_updating = False
+            self._replan_noise_events()
+
+    @Slot()
+    def _noise_param_manual_change(self) -> None:
+        """Switch combo to 'Custom' when user edits a spinbox manually."""
+        if not self._noise_preset_updating:
+            custom_idx = len(NI.NOISE_PRESET_NAMES)   # last item
+            if self.combo_noise_preset.currentIndex() != custom_idx:
+                self.combo_noise_preset.blockSignals(True)
+                self.combo_noise_preset.setCurrentIndex(custom_idx)
+                self.combo_noise_preset.blockSignals(False)
 
     # ─────────────────────────────────────────────────────────────────
     #  NOISE LIVE PREVIEW
@@ -1155,7 +1412,8 @@ class SimulationGUI(QMainWindow):
         if not inp or not Path(inp).is_dir():
             QMessageBox.warning(
                 self, "Invalid input",
-                "Select a valid input folder containing mask images.")
+                "Select a valid clean mask root folder\n"
+                "(parent directory containing tool subfolders).")
             return
 
         self.btn_noise_batch.setEnabled(False)
@@ -1190,6 +1448,83 @@ class SimulationGUI(QMainWindow):
         self._log("── Noise batch finished ──")
 
     # ─────────────────────────────────────────────────────────────────
+    #  AUGMENTATION HANDLERS
+    # ─────────────────────────────────────────────────────────────────
+
+    @Slot(int)
+    def _on_aug_preset_changed(self, idx: int) -> None:
+        """Fill scale spinboxes from the selected preset."""
+        if idx < len(AUG.PRESET_NAMES):
+            name = AUG.PRESET_NAMES[idx]
+            sx, sy, sz = AUG.PRESETS[name]
+            self.spin_aug_sx.setValue(sx)
+            self.spin_aug_sy.setValue(sy)
+            self.spin_aug_sz.setValue(sz)
+            self.spin_aug_sx.setEnabled(False)
+            self.spin_aug_sy.setEnabled(False)
+            self.spin_aug_sz.setEnabled(False)
+        else:
+            # "Custom" selected — unlock spinboxes
+            self.spin_aug_sx.setEnabled(True)
+            self.spin_aug_sy.setEnabled(True)
+            self.spin_aug_sz.setEnabled(True)
+
+    def _collect_aug_cfg(self) -> Dict[str, Any]:
+        idx = self.combo_aug_preset.currentIndex()
+        preset_name = (
+            AUG.PRESET_NAMES[idx]
+            if idx < len(AUG.PRESET_NAMES)
+            else "Custom"
+        )
+        return dict(
+            preset=preset_name,
+            scale_x=self.spin_aug_sx.value(),
+            scale_y=self.spin_aug_sy.value(),
+            scale_z=self.spin_aug_sz.value(),
+        )
+
+    @Slot()
+    def _on_augment(self) -> None:
+        inp = self.aug_input_edit.text().strip()
+        out = self.aug_output_edit.text().strip()
+        if not inp or not Path(inp).is_dir():
+            QMessageBox.warning(
+                self, "Invalid input",
+                "Select a valid folder containing STEP files.")
+            return
+
+        self.btn_augment.setEnabled(False)
+        self.btn_augment_abort.setEnabled(True)
+        self.prog_augment.setValue(0)
+
+        self._augment_worker = AugmentWorker(
+            inp, out, self._collect_aug_cfg())
+        self._augment_worker.sig.frame_done.connect(
+            self._on_augment_progress)
+        self._augment_worker.sig.log.connect(self._log)
+        self._augment_worker.sig.error.connect(self._on_error)
+        self._augment_worker.sig.finished.connect(
+            self._on_augment_finished)
+        self._augment_worker.start()
+
+    @Slot()
+    def _on_augment_abort(self) -> None:
+        if hasattr(self, '_augment_worker') and self._augment_worker is not None:
+            self._augment_worker.abort()
+            self._log("[USER] Augmentation abort requested …")
+
+    @Slot(int, int)
+    def _on_augment_progress(self, done: int, total: int) -> None:
+        self.prog_augment.setMaximum(total)
+        self.prog_augment.setValue(done)
+
+    @Slot()
+    def _on_augment_finished(self) -> None:
+        self.btn_augment.setEnabled(True)
+        self.btn_augment_abort.setEnabled(False)
+        self._log("── Augmentation batch finished ──")
+
+    # ─────────────────────────────────────────────────────────────────
     #  GENERATE DATASET
     # ─────────────────────────────────────────────────────────────────
 
@@ -1203,8 +1538,25 @@ class SimulationGUI(QMainWindow):
 
         model_paths = [self.file_list.item(i).text() for i in range(n)]
         rc = self._collect_render_cfg()
-        nc = self._collect_noise_cfg()
-        apply_noise = self.chk_noise.isChecked()
+        all_presets = self.chk_all_noise_presets.isChecked()
+        apply_noise = self.chk_noise.isChecked() or all_presets
+
+        # Build list of noise configs
+        noise_cfgs: List[Dict[str, Any]] = []
+        if apply_noise:
+            if all_presets:
+                # Use ALL presets (overrides single-preset checkbox)
+                for name, p in NI.NOISE_PRESETS.items():
+                    cfg = dict(p)          # copy
+                    cfg["preset_label"] = name
+                    noise_cfgs.append(cfg)
+                self._log(
+                    f"[NOISE] Multi-preset mode: {len(noise_cfgs)} presets")
+            else:
+                # Use only the current GUI values
+                nc = self._collect_noise_cfg()
+                nc["preset_label"] = self.combo_noise_preset.currentText()
+                noise_cfgs.append(nc)
 
         self.prog_tools.setMaximum(n)
         self.prog_tools.setValue(0)
@@ -1221,7 +1573,7 @@ class SimulationGUI(QMainWindow):
             clean_output_dir=self.render_out_edit.text(),
             noisy_output_dir=self.noisy_out_edit.text(),
             render_cfg=rc,
-            noise_cfg=nc,
+            noise_cfgs=noise_cfgs,
             apply_noise=apply_noise,
         )
         self._worker.sig.tool_started.connect(self._on_tool_started)

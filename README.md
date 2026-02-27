@@ -1,6 +1,6 @@
 # Simulation — Sim2Real Mask Generation
 
-Generates synthetic binary mask datasets from 3D CAD models and injects realistic edge noise to bridge the sim-to-real gap.
+Generates synthetic binary mask datasets from 3D CAD models, injects realistic edge noise, and augments CAD geometry — all to bridge the sim-to-real gap for ML training.
 
 ## Project Structure
 
@@ -8,9 +8,11 @@ Generates synthetic binary mask datasets from 3D CAD models and injects realisti
 |---|---|
 | `render_engine.py` | 360° binary mask renderer (CLI) — loads STEP/STL, places a virtual camera at 250 mm working distance, outputs one mask per degree of rotation |
 | `noise_injector.py` | Temporally-coherent contour-dent noise (CLI) — erodes the mask boundary at random locations with a cosine fade-in/fade-out across consecutive frames |
-| `simulation_gui.py` | Desktop GUI (PySide6) — integrates both modules with live previews, frame scrubber, parameter tuning, and batch processing |
+| `augmentor.py` | CAD geometry augmentation (CLI) — applies non-uniform scaling to STEP files to create geometrically diverse training data |
+| `simulation_gui.py` | Desktop GUI (PySide6) — integrates all three modules with live previews, frame scrubber, parameter tuning, presets, and batch processing |
 | `drills/` | CAD model files (.STEP) |
-| `output/` | Default output directory for rendered masks |
+| `output/` | Default output directory for rendered clean masks |
+| `output_noisy/` | Default output directory for noisy masks (versioned `noise_NNN/` subfolders) |
 
 ## Dependencies
 
@@ -26,10 +28,40 @@ From the Simulation folder:
 python simulation_gui.py
 ```
 
-Dark-themed PySide6 application with two tabs:
+Dark-themed PySide6 application with three tabs:
 
-- **Render** — select CAD files, configure camera (working distance, resolution, frame count), preview renders, and batch-generate clean mask datasets
-- **Noise** — tune edge-noise parameters with a live before/after preview on any sample mask, run standalone batch noise injection on existing mask folders
+- **Render** — select CAD files, configure camera (working distance, resolution, frame count, image format), preview renders, and batch-generate clean mask datasets (default format: TIFF)
+- **Noise** — select a noise preset (Default / Moderate / Aggressive) or tune custom parameters with a live before/after preview and frame scrubber; run standalone batch noise injection on existing mask folders
+- **Augment** — select a geometry preset or set custom scale X/Y/Z factors; batch-augment all STEP files in a folder with versioned output
+
+### Noise Presets
+
+Three built-in presets, selectable in the GUI or applied all at once during generation:
+
+| Preset | Events | Frame Span | Dent Arc (px) | Max Depth |
+|---|---|---|---|---|
+| **Default** | 1 | 10–20 | 250–500 | 3.5 |
+| **Moderate** | 2 | 10–20 | 250–500 | 5.0 |
+| **Aggressive** | 3 | 10–20 | 300–600 | 4.0 |
+
+**Generation modes:**
+- **"Apply current noise preset"** — uses the single currently-selected preset (or custom values), writing one `noise_NNN/` folder
+- **"Apply ALL noise presets"** — renders clean masks once, then applies every preset, creating one `noise_NNN/` folder per preset (overrides the single-preset checkbox)
+
+### Augmentation Presets
+
+Six geometry presets for non-uniform STEP file scaling:
+
+| Preset | Scale X | Scale Y | Scale Z |
+|---|---|---|---|
+| Longer Flutes (Z×1.10) | 1.00 | 1.00 | 1.10 |
+| Thinner Drill (XY×0.90) | 0.90 | 0.90 | 1.00 |
+| Wider Drill (XY×1.10) | 1.10 | 1.10 | 1.00 |
+| Long & Thin (Z×1.08, XY×0.92) | 0.92 | 0.92 | 1.08 |
+| Short & Wide (Z×0.92, XY×1.08) | 1.08 | 1.08 | 0.92 |
+| Uniform Up-scale (×1.05) | 1.05 | 1.05 | 1.05 |
+
+Output is saved in versioned `aug_NNN/` subfolders with an `augmentation_config.json` metadata file.
 
 ## Render Engine (CLI)
 
@@ -55,8 +87,8 @@ Apply temporally-coherent contour-dent noise to a folder of ordered mask frames:
 
 ```bash
 python noise_injector.py -i output/2396N63_Carbide
-python noise_injector.py -i output/2396N63_Carbide --n-events 1 --max-depth 3
-python noise_injector.py -i output/2396N63_Carbide --frame-span-max 20 --span-min 100
+python noise_injector.py -i output/2396N63_Carbide --n-events 2 --max-depth 5
+python noise_injector.py -i output/2396N63_Carbide --frame-span-max 20 --span-min 250
 ```
 
 ### CLI Options
@@ -65,12 +97,12 @@ python noise_injector.py -i output/2396N63_Carbide --frame-span-max 20 --span-mi
 |---|---|---|
 | `-i`, `--input` | Directory of ordered mask frames (sorted by name) | *required* |
 | `-o`, `--output` | Output directory | `<input>_noisy` |
-| `--n-events` | Number of dent events per tool | 2 |
-| `--frame-span-min` | Minimum consecutive frames each dent persists | 5 |
-| `--frame-span-max` | Maximum consecutive frames each dent persists | 15 |
-| `--span-min` | Minimum contour-pixel arc length per dent | 80 |
-| `--span-max` | Maximum contour-pixel arc length per dent | 250 |
-| `--max-depth` | Peak erosion depth in pixels | 2.5 |
+| `--n-events` | Number of dent events per tool | 1 |
+| `--frame-span-min` | Minimum consecutive frames each dent persists | 10 |
+| `--frame-span-max` | Maximum consecutive frames each dent persists | 20 |
+| `--span-min` | Minimum contour-pixel arc length per dent | 250 |
+| `--span-max` | Maximum contour-pixel arc length per dent | 500 |
+| `--max-depth` | Peak erosion depth in pixels | 3.5 |
 | `--seed` | RNG seed for reproducibility | random |
 
 ### Parameter Reference
@@ -100,3 +132,26 @@ The noise simulates localised under-segmentation caused by specular reflection o
 3. **Wrap-around**: Events that span past frame 359 wrap back to frame 0, maintaining continuity.
 
 The GUI's **frame scrubber** lets you preview this temporal behaviour on a loaded sample mask. The "Jump to Peak" button takes you to the frame with maximum dent visibility.
+
+## Augmentor (CLI)
+
+Apply non-uniform scaling to STEP CAD files to create geometrically varied training data:
+
+```bash
+python augmentor.py -i drills
+python augmentor.py -i drills --preset 1
+python augmentor.py -i drills --sx 0.95 --sy 0.95 --sz 1.12
+```
+
+### CLI Options
+
+| Flag | Description | Default |
+|---|---|---|
+| `-i`, `--input` | Folder containing STEP files | *required* |
+| `-o`, `--output` | Output root folder | `<input>_augmented` |
+| `--preset` | Preset number (1–6, see table above) | none |
+| `--sx` | Scale factor for X axis | 1.0 |
+| `--sy` | Scale factor for Y axis | 1.0 |
+| `--sz` | Scale factor for Z axis | 1.0 |
+
+Output is written to a versioned `aug_NNN/` subfolder with `augmentation_config.json` recording the parameters used. The transform uses OpenCascade's `BRepBuilderAPI_GTransform` so the result is a proper B-Rep STEP file (not a facetted mesh).

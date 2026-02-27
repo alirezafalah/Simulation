@@ -29,12 +29,14 @@ API Overview
 from __future__ import annotations
 
 import argparse
+import json
 import time
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 
 import cv2
 from PIL import Image
@@ -54,6 +56,27 @@ N_FRAMES: int        = 360      # total frames in one rotation
 
 OUTPUT_IMAGE_FORMAT: str = "PNG"
 NUM_IO_THREADS: int  = 12
+
+# ═════════════════════════════════════════════════════════════════════
+#  NOISE PRESETS — named parameter sets for quick selection
+# ═════════════════════════════════════════════════════════════════════
+
+NOISE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "Default (1 event, depth 3.5)": dict(
+        n_events=1, frame_span_min=10, frame_span_max=20,
+        dent_span_min=250, dent_span_max=500, max_depth=3.5, seed=None,
+    ),
+    "Moderate (2 events, depth 5.0)": dict(
+        n_events=2, frame_span_min=10, frame_span_max=20,
+        dent_span_min=250, dent_span_max=500, max_depth=5.0, seed=None,
+    ),
+    "Aggressive (3 events, depth 4.0)": dict(
+        n_events=3, frame_span_min=10, frame_span_max=20,
+        dent_span_min=300, dent_span_max=600, max_depth=4.0, seed=None,
+    ),
+}
+
+NOISE_PRESET_NAMES: List[str] = list(NOISE_PRESETS.keys())
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -111,7 +134,9 @@ def plan_dent_events(
 
     for _ in range(n_events):
         # Temporal: how many frames, and where in the rotation
-        fspan = rng.integers(frame_span_min, frame_span_max + 1)
+        fs_lo = min(frame_span_min, frame_span_max)
+        fs_hi = max(frame_span_min, frame_span_max)
+        fspan = rng.integers(fs_lo, fs_hi + 1)
         fspan = min(fspan, n_frames)
         start = rng.integers(0, n_frames)
         end   = start + fspan - 1               # may wrap past n_frames
@@ -119,7 +144,9 @@ def plan_dent_events(
 
         # Spatial: where on the contour and how big
         contour_frac = rng.uniform(0.0, 1.0)
-        dent_span    = rng.integers(dent_span_min, dent_span_max + 1)
+        ds_lo = min(dent_span_min, dent_span_max)
+        ds_hi = max(dent_span_min, dent_span_max)
+        dent_span    = rng.integers(ds_lo, ds_hi + 1)
         depth        = rng.uniform(1.0, max(1.0, max_depth))
 
         events.append(DentEvent(
@@ -299,8 +326,51 @@ def inject_noise(
     return _apply_dents(mask, dents)
 
 
-# ═════════════════════════════════════════════════════════════════════
-#  BATCH — folder processing (sequential, with temporal coherence)
+# ═════════════════════════════════════════════════════════════════════#  VERSIONED OUTPUT — auto-numbered noise run folders
+# ═════════════════════════════════════════════════════════════════
+
+def _next_noise_run_dir(parent: Path) -> Path:
+    """
+    Return the next available ``noise_NNN`` subdirectory under *parent*.
+
+    Scans existing ``noise_NNN`` folders and picks NNN+1.
+    """
+    parent.mkdir(parents=True, exist_ok=True)
+    existing = sorted(
+        int(d.name.split("_", 1)[1])
+        for d in parent.iterdir()
+        if d.is_dir() and d.name.startswith("noise_")
+           and d.name.split("_", 1)[1].isdigit()
+    )
+    next_id = (existing[-1] + 1) if existing else 1
+    return parent / f"noise_{next_id:03d}"
+
+
+def _write_noise_config(
+    run_dir: Path,
+    noise_cfg: Dict[str, Any],
+    *,
+    tool_names: Optional[List[str]] = None,
+) -> Path:
+    """
+    Write a ``noise_config.json`` into *run_dir* with all parameters
+    and metadata for reproducibility.
+    """
+    meta = {
+        "noise_type": "temporal_contour_dent",
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "parameters": {
+            k: v for k, v in noise_cfg.items()
+        },
+    }
+    if tool_names is not None:
+        meta["tools"] = tool_names
+    path = run_dir / "noise_config.json"
+    path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return path
+
+
+# ═════════════════════════════════════════════════════════════════#  BATCH — folder processing (sequential, with temporal coherence)
 # ═════════════════════════════════════════════════════════════════════
 
 def inject_noise_batch(
@@ -375,6 +445,129 @@ def inject_noise_batch(
           f"({total / t_total:.1f} img/s)")
 
 
+def inject_noise_batch_all(
+    clean_root: str,
+    noisy_root: str,
+    *,
+    n_events: int            = N_EVENTS,
+    frame_span_min: int      = FRAME_SPAN_MIN,
+    frame_span_max: int      = FRAME_SPAN_MAX,
+    dent_span_min: int       = DENT_SPAN_MIN,
+    dent_span_max: int       = DENT_SPAN_MAX,
+    max_depth: float         = MAX_DEPTH,
+    seed: Optional[int]      = None,
+    progress_callback=None,
+    log_callback=None,
+    abort_flag=None,
+) -> Optional[Path]:
+    """
+    Apply noise to **all** tool subfolders under *clean_root*.
+
+    Creates a versioned ``noise_NNN`` subfolder in *noisy_root* with a
+    ``noise_config.json`` documenting the parameters used.  Each tool's
+    noisy masks land in ``noise_NNN/<tool_name>/``.
+
+    Parameters
+    ----------
+    clean_root : str
+        Parent directory containing tool subfolders with clean masks.
+    noisy_root : str
+        Parent directory where versioned noise runs are stored.
+    progress_callback : callable(tool_idx, tool_count, frame_idx, frame_count)
+        Optional progress reporter.
+    log_callback : callable(msg: str)
+        Optional log message sink.
+    abort_flag : object with bool ``_abort`` attribute, or None.
+
+    Returns
+    -------
+    Path | None
+        The ``noise_NNN`` directory that was created, or None on abort.
+    """
+    _log = log_callback or print
+    clean_p = Path(clean_root)
+    noisy_p = Path(noisy_root)
+
+    # Discover tool subfolders (each contains mask PNGs)
+    tool_dirs = sorted(
+        d for d in clean_p.iterdir()
+        if d.is_dir() and any(
+            f.suffix.lower() in (".png", ".tiff", ".tif")
+            for f in d.iterdir()
+        )
+    )
+    if not tool_dirs:
+        _log(f"[NOISE] No tool subfolders with masks found in {clean_p}")
+        return None
+
+    # Create versioned run folder
+    run_dir = _next_noise_run_dir(noisy_p)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    noise_cfg = dict(
+        n_events=n_events,
+        frame_span_min=frame_span_min,
+        frame_span_max=frame_span_max,
+        dent_span_min=dent_span_min,
+        dent_span_max=dent_span_max,
+        max_depth=max_depth,
+        seed=seed,
+    )
+    tool_names = [d.name for d in tool_dirs]
+    _write_noise_config(run_dir, noise_cfg, tool_names=tool_names)
+
+    n_tools = len(tool_dirs)
+    _log(f"[NOISE] {n_tools} tools → {run_dir.name}")
+
+    for ti, tool_dir in enumerate(tool_dirs):
+        if abort_flag is not None and getattr(abort_flag, '_abort', False):
+            _log("[ABORT] Noise batch cancelled.")
+            return None
+
+        tool_name = tool_dir.name
+        _log(f"── {ti+1}/{n_tools}: {tool_name} ──")
+
+        files = sorted(
+            f for f in tool_dir.iterdir()
+            if f.suffix.lower() in (".png", ".tiff", ".tif")
+        )
+        if not files:
+            _log(f"   (no mask files, skipping)")
+            continue
+
+        total = len(files)
+        out_tool = run_dir / tool_name
+        out_tool.mkdir(parents=True, exist_ok=True)
+
+        events = plan_dent_events(
+            n_events=n_events,
+            n_frames=total,
+            frame_span_min=frame_span_min,
+            frame_span_max=frame_span_max,
+            dent_span_min=dent_span_min,
+            dent_span_max=dent_span_max,
+            max_depth=max_depth,
+            seed=seed,
+        )
+
+        for fi, src in enumerate(files):
+            if abort_flag is not None and getattr(abort_flag, '_abort', False):
+                _log("[ABORT] Noise batch cancelled.")
+                return None
+
+            img = np.array(Image.open(src).convert("L"), dtype=np.uint8)
+            img = np.where(img > 127, 255, 0).astype(np.uint8)
+            noisy = inject_noise_frame(img, events, fi, n_frames=total)
+            Image.fromarray(noisy, mode="L").save(
+                str(out_tool / src.name), format="PNG")
+
+            if progress_callback is not None:
+                progress_callback(ti, n_tools, fi + 1, total)
+
+    _log(f"[DONE] Noise run complete → {run_dir}")
+    return run_dir
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  CLI ENTRY POINT
 # ═════════════════════════════════════════════════════════════════════
@@ -386,19 +579,28 @@ def main() -> None:
         description="Temporally-coherent contour-dent noise for sim masks",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "Modes:\n"
+            "  Multi-tool (default):  -i points to clean root with tool subfolders\n"
+            "      → auto-creates output_noisy/noise_NNN/ with noise_config.json\n\n"
+            "  Single-folder:  --single  -i points to one folder of masks\n"
+            "      → writes noisy masks directly into -o\n\n"
             "Examples:\n"
-            '  python noise_injector.py -i output/2396N63_Carbide\n'
-            '  python noise_injector.py -i output/2396N63_Carbide --n-events 1\n'
-            '  python noise_injector.py -i output/2396N63_Carbide --max-depth 3 --frame-span-max 20\n'
+            '  python noise_injector.py -i output\n'
+            '  python noise_injector.py -i output -o output_noisy --n-events 2\n'
+            '  python noise_injector.py --single -i output/2396N63_Carbide\n'
         ),
     )
     parser.add_argument(
         "-i", "--input", required=True,
-        help="Directory of ordered mask frames (sorted by name)",
+        help="Clean mask root (multi-tool) or single folder (--single)",
     )
     parser.add_argument(
         "-o", "--output", default=None,
-        help="Output directory (default: <input>_noisy)",
+        help="Noisy output root (default: <input>_noisy)",
+    )
+    parser.add_argument(
+        "--single", action="store_true",
+        help="Single-folder mode: input is one folder of masks, not a root",
     )
     parser.add_argument(
         "--n-events", type=int, default=N_EVENTS,
@@ -444,8 +646,9 @@ def main() -> None:
     print("=" * 62)
     print("  noise_injector.py — Temporal Contour-Dent Noise")
     print("=" * 62)
+    print(f"  Mode        : {'single-folder' if args.single else 'multi-tool (versioned)'}")
     print(f"  Input       : {inp}")
-    print(f"  Output      : {out}")
+    print(f"  Output root : {out}")
     print(f"  Events      : {args.n_events}")
     print(f"  Frame span  : {args.frame_span_min}–{args.frame_span_max}")
     print(f"  Dent span   : {args.span_min}–{args.span_max} contour px")
@@ -453,8 +656,7 @@ def main() -> None:
     print(f"  Seed        : {args.seed}")
     print("=" * 62)
 
-    inject_noise_batch(
-        str(inp), str(out),
+    common_kw = dict(
         n_events=args.n_events,
         frame_span_min=args.frame_span_min,
         frame_span_max=args.frame_span_max,
@@ -463,6 +665,14 @@ def main() -> None:
         max_depth=args.max_depth,
         seed=args.seed,
     )
+
+    if args.single:
+        inject_noise_batch(str(inp), str(out), **common_kw)
+    else:
+        run_dir = inject_noise_batch_all(
+            str(inp), str(out), **common_kw)
+        if run_dir is not None:
+            print(f"\n  Created: {run_dir}")
 
     print("[EXIT]")
 
