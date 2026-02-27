@@ -433,7 +433,8 @@ def inject_noise_batch(
         noisy = inject_noise_frame(img, events, frame_idx, n_frames=total)
 
         dst = out / src.name
-        Image.fromarray(noisy, mode="L").save(str(dst), format="PNG")
+        fmt = "TIFF" if src.suffix.lower() in (".tiff", ".tif") else "PNG"
+        Image.fromarray(noisy, mode="L").save(str(dst), format=fmt)
 
         if (frame_idx + 1) % 36 == 0 or frame_idx + 1 == total:
             elapsed = time.perf_counter() - t0
@@ -558,8 +559,9 @@ def inject_noise_batch_all(
             img = np.array(Image.open(src).convert("L"), dtype=np.uint8)
             img = np.where(img > 127, 255, 0).astype(np.uint8)
             noisy = inject_noise_frame(img, events, fi, n_frames=total)
+            fmt = "TIFF" if src.suffix.lower() in (".tiff", ".tif") else "PNG"
             Image.fromarray(noisy, mode="L").save(
-                str(out_tool / src.name), format="PNG")
+                str(out_tool / src.name), format=fmt)
 
             if progress_callback is not None:
                 progress_callback(ti, n_tools, fi + 1, total)
