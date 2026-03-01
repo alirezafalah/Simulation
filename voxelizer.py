@@ -26,9 +26,9 @@ for CPU-parallel processing.
 
 Coordinate mapping  (mesh → voxel grid)
 ---------------------------------------
-    mesh X  →  voxel X  (lateral, left–right)
-    mesh Z  →  voxel Y  (axial, along tool shaft — up in image)
-    mesh Y  →  voxel Z  (depth, front–back)
+    mesh X   →  voxel X  (lateral, left–right)
+    mesh Z   →  voxel Y  (axial, along tool shaft — up in image)
+   −mesh Y   →  voxel Z  (depth, front–back; matches Visual Hull convention)
 
 Dependencies
 ------------
@@ -228,7 +228,7 @@ def _make_query_grid(
     Axis mapping
     ------------
     query axis 0  (mesh X)  →  voxel X   :  volume_bounds[0]
-    query axis 1  (mesh Y)  →  voxel Z   :  volume_bounds[2]
+    query axis 1  (mesh Y)  →  voxel Z   :  volume_bounds[2]  (flipped in voxelize())
     query axis 2  (mesh Z)  →  voxel Y   :  volume_bounds[1]
 
     Returns shape (N³, 3) float64.
@@ -297,9 +297,16 @@ def voxelize(
     #     0: mesh X  →  voxel X
     #     1: mesh Y  →  voxel Z
     #     2: mesh Z  →  voxel Y
-    #  Transpose (0, 2, 1) → (voxel X, voxel Y, voxel Z)
+    #  Transpose (0, 2, 1) → (voxel X, voxel Y, voxel Z=+mesh_Y)
     inside_3d = inside.reshape(N, N, N).astype(bool)
     voxel_grid = np.transpose(inside_3d, (0, 2, 1))
+
+    # ── Flip depth axis to match Visual Hull convention ──────────────
+    #  The VH defines depth as VH_Z = −mesh_Y (camera sits on −Y
+    #  looking toward +Y at θ=0).  After transpose voxel Z increases
+    #  with +mesh_Y; flipping axis 2 corrects the direction so that
+    #  voxel_Z index 0 → −10 mm and index N−1 → +10 mm in VH_Z.
+    voxel_grid = voxel_grid[:, :, ::-1].copy()
 
     return voxel_grid
 
