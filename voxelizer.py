@@ -77,6 +77,13 @@ TESS_ANGULAR: float = 0.1         # STEP → STL angular tolerance (rad)
 TIP_FROM_TOP: float = 0.80        # Matches render_engine.TIP_FROM_TOP
 CAD_EXTENSIONS       = {".step", ".stp", ".stl"}
 
+# Camera constants (must match render_engine.py exactly)
+_FOCAL_LENGTH_MM:      float = 75.0
+_SENSOR_H_MM:          float = 4.8
+_WORKING_DISTANCE_MM:  float = 250.0
+_VFOV_RAD:             float = 2.0 * np.arctan(_SENSOR_H_MM / (2.0 * _FOCAL_LENGTH_MM))
+_H_VISIBLE_MM:         float = 2.0 * _WORKING_DISTANCE_MM * np.tan(_VFOV_RAD / 2.0)  # ≈16.0 mm
+
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
 
@@ -190,23 +197,40 @@ def align_mesh(
     mesh.points[:, 2] *= -1
 
     # ── Step 3: Translate Z for tip position in global volume ────────
+    #
+    # The tip position must match where the Visual Hull reconstruction
+    # would place it.  The VH engine estimates cy (vertical centre in
+    # pixels) as the midpoint of the visible tool extent.  We replicate
+    # that camera-framing math here so both outputs agree.
+    #
+    #   render_engine camera:  tip at 'tip_from_top' fraction from the
+    #   top of a visible window of height H_visible ≈ 16 mm.
+    #
+    #   frac_top_tool = 1 − tip_from_top − tool_height / H_visible
+    #   (negative ⟹ tool extends past the top of the frame → clip to 0)
+    #
+    #   VH cy estimation:  cy = (frac_top_visible + tip_from_top) / 2
+    #   ⟹  tip_Y  = H_visible × (frac_top_visible − tip_from_top) / 2
+    #
     _, _, _, _, zmin, zmax = mesh.bounds
     tip_z = zmin
     tool_height = zmax - zmin
 
-    # Voxel Y (axial) ↔ mesh Z
-    y_lo = float(volume_bounds[1, 0])
-    y_hi = float(volume_bounds[1, 1])
-    vol_height = y_hi - y_lo                      # 20.0 mm
+    # Where does the tool's top edge appear in the camera frame?
+    frac_top_tool = 1.0 - tip_from_top - tool_height / _H_VISIBLE_MM
+    frac_top_visible = max(0.0, frac_top_tool)   # clip if past frame
 
-    # Target tip position: e.g. 10 − 0.80 × 20 = −6.0 mm
-    target_tip = y_hi - tip_from_top * vol_height
+    # Replicate VH silhouette-analysis cy → derive the tip's grid-Y
+    # For almost all tools (height > ~3.2 mm): target ≈ −6.4 mm
+    target_tip = _H_VISIBLE_MM * (frac_top_visible - tip_from_top) / 2.0
+
     offset_z   = target_tip - tip_z
     mesh.translate([0.0, 0.0, offset_z], inplace=True)
 
     info = dict(
         tip_target_mm=target_tip,
         tool_height_mm=tool_height,
+        frac_top_visible=frac_top_visible,
         n_vertices=mesh.n_points,
         n_faces=mesh.n_cells,
     )
