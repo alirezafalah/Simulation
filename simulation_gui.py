@@ -52,6 +52,7 @@ from PySide6.QtWidgets import (
 import render_engine as RE
 import noise_injector as NI
 import augmentor as AUG
+import voxelizer as VX
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 
@@ -515,6 +516,67 @@ class NoiseBatchWorker(QThread):
             self.sig.finished.emit()
 
 
+class VoxelizerWorker(QThread):
+    """Thread: voxelize all CAD files in a folder using ProcessPoolExecutor."""
+    sig = _WorkerSignals()
+
+    def __init__(
+        self,
+        model_paths: List[str],
+        output_dir: str,
+        spec_path: str,
+        tip_from_top: float,
+        max_workers: int,
+    ):
+        super().__init__()
+        self.model_paths  = model_paths
+        self.output_dir   = output_dir
+        self.spec_path    = spec_path
+        self.tip_from_top = tip_from_top
+        self.max_workers  = max_workers
+        self._abort       = False
+
+    def abort(self) -> None:
+        self._abort = True
+
+    def run(self) -> None:
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+        try:
+            total = len(self.model_paths)
+            self.sig.log.emit(
+                f"[VOXEL] Processing {total} tool(s) with "
+                f"{self.max_workers} worker(s) …")
+
+            done = 0
+            with ProcessPoolExecutor(
+                max_workers=self.max_workers
+            ) as pool:
+                futures = {
+                    pool.submit(
+                        VX.voxelize_single_tool,
+                        mp,
+                        self.output_dir,
+                        self.spec_path,
+                        self.tip_from_top,
+                    ): mp
+                    for mp in self.model_paths
+                }
+                for future in as_completed(futures):
+                    if self._abort:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        self.sig.log.emit("[VOXEL] Aborted.")
+                        break
+                    result = future.result()
+                    done += 1
+                    self.sig.log.emit(f"[VOXEL] {result['message']}")
+                    self.sig.frame_done.emit(done, total)
+
+        except Exception:
+            self.sig.error.emit(traceback.format_exc())
+        finally:
+            self.sig.finished.emit()
+
+
 # ═════════════════════════════════════════════════════════════════════
 #  DARK PALETTE
 # ═════════════════════════════════════════════════════════════════════
@@ -557,6 +619,7 @@ class SimulationGUI(QMainWindow):
         self._worker: Optional[DatasetWorker] = None
         self._preview_worker: Optional[PreviewWorker] = None
         self._noise_batch_worker: Optional[NoiseBatchWorker] = None
+        self._voxelizer_worker: Optional[VoxelizerWorker] = None
 
         # Cached sample mask for live noise preview
         self._sample_mask: Optional[np.ndarray] = None
@@ -582,6 +645,7 @@ class SimulationGUI(QMainWindow):
         self.tabs.addTab(self._build_render_tab(), "⚙  Render")
         self.tabs.addTab(self._build_noise_tab(),  "🔊  Noise")
         self.tabs.addTab(self._build_augment_tab(), "🔧  Augment")
+        self.tabs.addTab(self._build_voxel_tab(),  "🧊  Ground Truth")
         root.addWidget(self.tabs, stretch=1)
 
         # ── Progress bars ────────────────────────────────────────────
@@ -1184,6 +1248,155 @@ class SimulationGUI(QMainWindow):
         tab.setWidget(inner)
         return tab
 
+    # ── GROUND TRUTH / VOXELIZER TAB ─────────────────────────────────
+
+    def _build_voxel_tab(self) -> QWidget:
+        tab = QScrollArea()
+        tab.setWidgetResizable(True)
+        tab.setFrameShape(QScrollArea.NoFrame)
+        inner = QWidget()
+        lay = QVBoxLayout(inner)
+        lay.setSpacing(8)
+
+        # --- Info banner ---
+        info = QLabel(
+            "<b>Ground Truth Voxelizer</b> — load CAD models, align "
+            "identically to render_engine.py, and voxelize into a boolean "
+            "N×N×N grid for 3D CNN training.<br>"
+            "Reads <code>voxel_grid_spec.json</code> for the global "
+            "bounding volume and grid shape."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #aaa; padding: 4px;")
+        lay.addWidget(info)
+
+        # --- Spec file ---
+        spec_group = QGroupBox("Voxel Grid Spec")
+        sg_lay = QGridLayout(spec_group)
+
+        _default_spec = str(
+            _SCRIPT_DIR.parent
+            / "Tool_Condition_Monitoring" / "3D_reconstruction"
+            / "voxel_grid_spec.json"
+        )
+        sg_lay.addWidget(QLabel("Spec JSON:"), 0, 0)
+        self.vox_spec_edit = QLineEdit(_default_spec)
+        self.vox_spec_edit.setToolTip(
+            "Path to voxel_grid_spec.json that defines\n"
+            "the global bounding cube and grid shape.")
+        sg_lay.addWidget(self.vox_spec_edit, 0, 1)
+        btn_spec = QPushButton("Browse …")
+        btn_spec.clicked.connect(self._browse_spec_file)
+        sg_lay.addWidget(btn_spec, 0, 2)
+
+        self.vox_spec_info = QLabel("Click 'Load Spec' to read parameters.")
+        self.vox_spec_info.setStyleSheet("color: #888; font-size: 11px;")
+        self.vox_spec_info.setWordWrap(True)
+        sg_lay.addWidget(self.vox_spec_info, 1, 0, 1, 2)
+
+        btn_load_spec = QPushButton("Load Spec")
+        btn_load_spec.setToolTip("Parse the JSON and display grid parameters.")
+        btn_load_spec.clicked.connect(self._on_load_vox_spec)
+        sg_lay.addWidget(btn_load_spec, 1, 2)
+
+        lay.addWidget(spec_group)
+
+        # --- Input / output directories ---
+        dir_group = QGroupBox("Directories")
+        dg_lay = QGridLayout(dir_group)
+
+        dg_lay.addWidget(QLabel("CAD input folder:"), 0, 0)
+        self.vox_input_edit = QLineEdit(str(_SCRIPT_DIR / "drills"))
+        self.vox_input_edit.setToolTip(
+            "Folder containing .step / .stp / .stl CAD files to voxelize.")
+        dg_lay.addWidget(self.vox_input_edit, 0, 1)
+        btn_vi = QPushButton("Browse …")
+        btn_vi.clicked.connect(
+            lambda: self._browse_dir(self.vox_input_edit))
+        dg_lay.addWidget(btn_vi, 0, 2)
+
+        dg_lay.addWidget(QLabel("NPZ output folder:"), 1, 0)
+        self.vox_output_edit = QLineEdit(
+            str(_SCRIPT_DIR / "output_voxels"))
+        self.vox_output_edit.setToolTip(
+            "Destination folder for the .npz voxel grid files.")
+        dg_lay.addWidget(self.vox_output_edit, 1, 1)
+        btn_vo = QPushButton("Browse …")
+        btn_vo.clicked.connect(
+            lambda: self._browse_dir(self.vox_output_edit))
+        dg_lay.addWidget(btn_vo, 1, 2)
+
+        lay.addWidget(dir_group)
+
+        # --- Parameters ---
+        param_group = QGroupBox("Voxelization Parameters")
+        pf_lay = QFormLayout(param_group)
+
+        self.spin_vox_tip = QDoubleSpinBox()
+        self.spin_vox_tip.setRange(0.01, 0.99)
+        self.spin_vox_tip.setValue(VX.TIP_FROM_TOP)
+        self.spin_vox_tip.setSingleStep(0.05)
+        self.spin_vox_tip.setDecimals(2)
+        self.spin_vox_tip.setToolTip(
+            "Fraction from the TOP of the global bounding volume\n"
+            "where the drill tip is placed.\n"
+            "0.80 = tip at 80 % from top (matching render_engine).")
+        pf_lay.addRow("Tip position (from top):", self.spin_vox_tip)
+
+        import os as _os
+        self.spin_vox_workers = QSpinBox()
+        self.spin_vox_workers.setRange(1, max(1, _os.cpu_count() or 4))
+        self.spin_vox_workers.setValue(
+            max(1, (_os.cpu_count() or 4) // 2))
+        self.spin_vox_workers.setToolTip(
+            "Number of parallel CPU processes.\n"
+            "Each process voxelizes one tool independently.\n"
+            f"Your system has {_os.cpu_count()} logical cores.")
+        pf_lay.addRow("Parallel workers:", self.spin_vox_workers)
+
+        lay.addWidget(param_group)
+
+        # --- Progress bar ---
+        self.prog_voxelize = QProgressBar()
+        self.prog_voxelize.setTextVisible(True)
+        self.prog_voxelize.setFormat("%v / %m  tools")
+        lay.addWidget(self.prog_voxelize)
+
+        # --- Action buttons ---
+        vbtn_row = QHBoxLayout()
+
+        self.btn_voxelize = QPushButton(
+            "  🧊  Voxelize All CAD Files  ")
+        self.btn_voxelize.setMinimumHeight(36)
+        self.btn_voxelize.setStyleSheet(
+            "QPushButton { background-color: #1a5a3a; color: white; "
+            "font-size: 13px; font-weight: bold; border-radius: 5px; }"
+            "QPushButton:hover { background-color: #20805a; }"
+            "QPushButton:disabled { background-color: #333; color: #666; }"
+        )
+        self.btn_voxelize.clicked.connect(self._on_voxelize)
+        vbtn_row.addWidget(self.btn_voxelize)
+
+        self.btn_voxelize_abort = QPushButton("Abort")
+        self.btn_voxelize_abort.setEnabled(False)
+        self.btn_voxelize_abort.setMinimumHeight(36)
+        self.btn_voxelize_abort.setStyleSheet(
+            "QPushButton { background-color: #8b1a1a; color: white; "
+            "font-size: 12px; border-radius: 5px; }"
+            "QPushButton:hover { background-color: #b22222; }"
+            "QPushButton:disabled { background-color: #333; color: #666; }"
+        )
+        self.btn_voxelize_abort.clicked.connect(self._on_voxelize_abort)
+        vbtn_row.addWidget(self.btn_voxelize_abort)
+
+        lay.addLayout(vbtn_row)
+
+        # Stretch at bottom
+        lay.addStretch(1)
+
+        tab.setWidget(inner)
+        return tab
+
     # ─────────────────────────────────────────────────────────────────
     #  HELPERS
     # ─────────────────────────────────────────────────────────────────
@@ -1523,6 +1736,113 @@ class SimulationGUI(QMainWindow):
         self.btn_augment.setEnabled(True)
         self.btn_augment_abort.setEnabled(False)
         self._log("── Augmentation batch finished ──")
+
+    # ─────────────────────────────────────────────────────────────────
+    #  GROUND TRUTH VOXELIZER HANDLERS
+    # ─────────────────────────────────────────────────────────────────
+
+    @Slot()
+    def _browse_spec_file(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select voxel_grid_spec.json",
+            self.vox_spec_edit.text(),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if path:
+            self.vox_spec_edit.setText(path)
+
+    @Slot()
+    def _on_load_vox_spec(self) -> None:
+        spec_path = self.vox_spec_edit.text().strip()
+        if not spec_path or not Path(spec_path).is_file():
+            QMessageBox.warning(
+                self, "Invalid spec",
+                "Select a valid voxel_grid_spec.json file.")
+            return
+        try:
+            spec = VX.load_spec(spec_path)
+            gs, vb = VX.parse_spec(spec)
+            voxel_size = float(
+                (vb[0, 1] - vb[0, 0]) / gs[0])
+            self.vox_spec_info.setText(
+                f"Grid: {gs[0]}×{gs[1]}×{gs[2]}  |  "
+                f"Bounds: [{vb[0,0]:.1f}, {vb[0,1]:.1f}] mm  |  "
+                f"Voxel size: {voxel_size:.4f} mm")
+            self.vox_spec_info.setStyleSheet(
+                "color: #9acd32; font-size: 11px;")
+            self._log(
+                f"[VOXEL] Spec loaded: {gs[0]}³ grid, "
+                f"bounds ±{vb[0,1]:.1f} mm, "
+                f"voxel {voxel_size:.4f} mm")
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Spec error", f"Failed to parse spec:\n{exc}")
+
+    @Slot()
+    def _on_voxelize(self) -> None:
+        inp = self.vox_input_edit.text().strip()
+        out = self.vox_output_edit.text().strip()
+        spec = self.vox_spec_edit.text().strip()
+
+        if not inp or not Path(inp).is_dir():
+            QMessageBox.warning(
+                self, "Invalid input",
+                "Select a valid folder containing CAD files.")
+            return
+        if not spec or not Path(spec).is_file():
+            QMessageBox.warning(
+                self, "Invalid spec",
+                "Select a valid voxel_grid_spec.json file.")
+            return
+
+        cad_files = VX.collect_cad_files(inp)
+        if not cad_files:
+            QMessageBox.warning(
+                self, "No CAD files",
+                f"No .step/.stp/.stl files found in:\n{inp}")
+            return
+
+        model_paths = [str(f) for f in cad_files]
+        self.btn_voxelize.setEnabled(False)
+        self.btn_voxelize_abort.setEnabled(True)
+        self.prog_voxelize.setValue(0)
+        self.prog_voxelize.setMaximum(len(model_paths))
+
+        self._log("=" * 50)
+        self._log(f"  Voxelizing {len(model_paths)} CAD file(s) …")
+        self._log("=" * 50)
+
+        self._voxelizer_worker = VoxelizerWorker(
+            model_paths=model_paths,
+            output_dir=out,
+            spec_path=spec,
+            tip_from_top=self.spin_vox_tip.value(),
+            max_workers=self.spin_vox_workers.value(),
+        )
+        self._voxelizer_worker.sig.frame_done.connect(
+            self._on_voxelize_progress)
+        self._voxelizer_worker.sig.log.connect(self._log)
+        self._voxelizer_worker.sig.error.connect(self._on_error)
+        self._voxelizer_worker.sig.finished.connect(
+            self._on_voxelize_finished)
+        self._voxelizer_worker.start()
+
+    @Slot()
+    def _on_voxelize_abort(self) -> None:
+        if self._voxelizer_worker is not None:
+            self._voxelizer_worker.abort()
+            self._log("[USER] Voxelization abort requested …")
+
+    @Slot(int, int)
+    def _on_voxelize_progress(self, done: int, total: int) -> None:
+        self.prog_voxelize.setMaximum(total)
+        self.prog_voxelize.setValue(done)
+
+    @Slot()
+    def _on_voxelize_finished(self) -> None:
+        self.btn_voxelize.setEnabled(True)
+        self.btn_voxelize_abort.setEnabled(False)
+        self._log("── Voxelization batch finished ──")
 
     # ─────────────────────────────────────────────────────────────────
     #  GENERATE DATASET
