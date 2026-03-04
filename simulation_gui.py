@@ -1311,7 +1311,10 @@ class SimulationGUI(QMainWindow):
         dg_lay.addWidget(QLabel("CAD input folder:"), 0, 0)
         self.vox_input_edit = QLineEdit(str(_SCRIPT_DIR / "drills"))
         self.vox_input_edit.setToolTip(
-            "Folder containing .step / .stp / .stl CAD files to voxelize.")
+            "Parent folder containing tool-type subdirectories\n"
+            "(e.g. drills/ and end_mills/), or a single flat folder\n"
+            "with .step / .stp / .stl CAD files.  All subdirectories\n"
+            "are scanned recursively.")
         dg_lay.addWidget(self.vox_input_edit, 0, 1)
         btn_vi = QPushButton("Browse …")
         btn_vi.clicked.connect(
@@ -1810,7 +1813,8 @@ class SimulationGUI(QMainWindow):
         if not cad_files:
             QMessageBox.warning(
                 self, "No CAD files",
-                f"No .step/.stp/.stl files found in:\n{inp}")
+                f"No .step/.stp/.stl files found in:\n{inp}\n"
+                "(subdirectories are also scanned)")
             return
 
         model_paths = [str(f) for f in cad_files]

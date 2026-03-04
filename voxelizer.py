@@ -150,7 +150,34 @@ def load_mesh(filepath: str) -> pv.PolyData:
 
 def get_tool_name(model_path: str) -> str:
     """Canonical tool name from filename stem (same rule as render_engine)."""
+    import re as _re
+
     stem = Path(model_path).stem
+    # Strip copy suffixes like " (1)"
+    stem = _re.sub(r'\s*\(\d+\)\s*$', '', stem)
+
+    # --- End Mill --------------------------------------------------------
+    if _re.search(r'End\s+Mill', stem, _re.IGNORECASE):
+        flute_match = _re.search(r'(\d+)-Flute', stem, _re.IGNORECASE)
+        name = _re.sub(r'\s*\d+-Flute\s*', ' ', stem).strip() if flute_match else stem
+        em = _re.search(r'End\s+Mill', name, _re.IGNORECASE)
+        if em:
+            name = name[:em.end()]
+        name = name.replace(' ', '_')
+        if flute_match:
+            return f"{flute_match.group(1)}_Flute_{name}"
+        return name
+
+    # --- Drill Bit (or any "…Bit") ----------------------------------------
+    drill_match = _re.search(r'Drill\s+Bit', stem, _re.IGNORECASE)
+    if drill_match:
+        return stem[:drill_match.end()].replace(' ', '_')
+
+    bit_match = _re.search(r'\bBit\b', stem, _re.IGNORECASE)
+    if bit_match:
+        return stem[:bit_match.end()].replace(' ', '_')
+
+    # --- Fallback ---------------------------------------------------------
     return stem.split(" ", 1)[0].strip()
 
 
@@ -481,10 +508,14 @@ def voxelize_single_tool(
 # ═════════════════════════════════════════════════════════════════════
 
 def collect_cad_files(folder: str | Path) -> List[Path]:
-    """Return sorted list of CAD files in *folder*."""
+    """Return sorted list of CAD files in *folder* and its subdirectories.
+
+    Supports a parent folder containing tool-type subdirectories
+    (e.g. ``drills/`` and ``end_mills/``) or a flat folder of CAD files.
+    """
     return sorted(
-        p for p in Path(folder).iterdir()
-        if p.suffix.lower() in CAD_EXTENSIONS
+        p for p in Path(folder).rglob('*')
+        if p.is_file() and p.suffix.lower() in CAD_EXTENSIONS
     )
 
 

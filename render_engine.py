@@ -148,11 +148,49 @@ def get_tool_name(model_path: str) -> str:
     """
     Extract canonical tool name from filename stem.
 
-    Rule: keep everything before the first space.
-    Example:
-        "29195A079_Carbide Drill Bit.STEP" -> "29195A079_Carbide"
+    • End mills  → ``{N}_Flute_{PartNum}_{Desc}_End_Mill``
+      Flute count is moved to the front; the ``{N}-Flute`` token is
+      removed from the body so it doesn't appear twice.
+    • Drill bits → ``{PartNum}_{Desc}_Drill_Bit``
+      Everything after "Drill Bit" (e.g. "with Coolant Holes") is
+      dropped.  Files that say "… Bit" without the word "Drill"
+      (e.g. "Chip Clearing Bit") are handled the same way.
+    • Fallback   → everything before the first space (legacy rule).
+
+    Spaces ➜ underscores, ``(1)`` copy suffixes are stripped.
     """
+    import re
+
     stem = Path(model_path).stem
+    # Strip copy suffixes like " (1)"
+    stem = re.sub(r'\s*\(\d+\)\s*$', '', stem)
+
+    # --- End Mill --------------------------------------------------------
+    if re.search(r'End\s+Mill', stem, re.IGNORECASE):
+        flute_match = re.search(r'(\d+)-Flute', stem, re.IGNORECASE)
+        # Remove the flute token from the body
+        name = re.sub(r'\s*\d+-Flute\s*', ' ', stem).strip() if flute_match else stem
+        # Truncate anything after "End Mill"
+        em = re.search(r'End\s+Mill', name, re.IGNORECASE)
+        if em:
+            name = name[:em.end()]
+        name = name.replace(' ', '_')
+        if flute_match:
+            return f"{flute_match.group(1)}_Flute_{name}"
+        return name
+
+    # --- Drill Bit (or any "…Bit") ----------------------------------------
+    drill_match = re.search(r'Drill\s+Bit', stem, re.IGNORECASE)
+    if drill_match:
+        name = stem[:drill_match.end()].replace(' ', '_')
+        return name
+
+    bit_match = re.search(r'\bBit\b', stem, re.IGNORECASE)
+    if bit_match:
+        name = stem[:bit_match.end()].replace(' ', '_')
+        return name
+
+    # --- Fallback ---------------------------------------------------------
     return stem.split(" ", 1)[0].strip()
 
 
